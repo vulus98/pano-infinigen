@@ -1,5 +1,5 @@
-iterate_scene_tasks.frame_range=[1,48]
-iterate_scene_tasks.render_frame_range=[48,48]
+iterate_scene_tasks.frame_range=[0,0]
+iterate_scene_tasks.render_frame_range=[0,0]
 iterate_scene_tasks.n_camera_rigs = 6
 iterate_scene_tasks.n_subcams = 1
 

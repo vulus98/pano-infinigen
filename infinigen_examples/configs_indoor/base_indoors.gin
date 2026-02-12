@@ -19,7 +19,7 @@ camera.camera_pose_proposal.pitch = ("clip_gaussian", 90, 15, 60, 95)
 camera.camera_pose_proposal.focal_length = 15
 fine_terrain.mesher_backend = "OcMesher" # spherical mesher doesnt support short focal length / wide fov
 
-camera.spawn_camera_rigs.n_camera_rigs = 20
+camera.spawn_camera_rigs.n_camera_rigs = 6
 camera.spawn_camera_rigs.camera_rig_config = [
     {'loc': (0, 0, 0), 'rot_euler': (0, 0, 0)},
     {'loc': (0.075, 0, 0), 'rot_euler': (0, 0, 0)},

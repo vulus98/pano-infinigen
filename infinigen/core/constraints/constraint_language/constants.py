@@ -145,7 +145,14 @@ class RoomConstants:
                 if len(invalid_indices) > 0:
                     i = invalid_indices[len(invalid_indices) // 2]
                     valid_indices.remove(i)
-                p = shapely.Polygon(coords[valid_indices + [valid_indices[0]]])
+                # A valid polygon ring needs at least 3 distinct vertices (4 coords including closure).
+                if len(valid_indices) < 3:
+                    raise NotImplementedError("Degenerate polygon")
+                try:
+                    p = shapely.Polygon(coords[valid_indices + [valid_indices[0]]])
+                except ValueError as e:
+                    # Shapely raises e.g. "A linearring requires at least 4 coordinates" for degenerate rings.
+                    raise NotImplementedError("Degenerate polygon") from e
                 if len(p.exterior.coords) == l:
                     break
             if not is_valid_polygon(p):
