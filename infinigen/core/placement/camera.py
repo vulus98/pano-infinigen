@@ -832,9 +832,10 @@ def save_camera_parameters(
             bpy.context.scene.render.resolution_x,
         )
     )
-    T = np.asarray(camera_obj.matrix_world, dtype=np.float64) @ np.diag(
-        (1.0, -1.0, -1.0, 1.0)
-    )  # Y down Z forward (aka opencv)
+    T = np.asarray(camera_obj.matrix_world, dtype=np.float64)
+    # T = np.asarray(camera_obj.matrix_world, dtype=np.float64) @ np.diag(
+    #     (1.0, -1.0, -1.0, 1.0)
+    #)  # Y down Z forward (aka opencv)
     np.savez(output_file, K=np.asarray(K, dtype=np.float64), T=T, HW=height_width)
 
 

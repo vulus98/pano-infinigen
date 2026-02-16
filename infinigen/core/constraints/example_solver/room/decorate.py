@@ -401,7 +401,9 @@ def populate_windows(
                 int(j), dimensions=dims, open=False, curtain=curtain, shutter=False
             )
         else:
-            window = factory(int(j), dimensions=dims)
+            window = factory(
+                int(j), dimensions=dims, open=False, curtain=curtain, shutter=False
+            )
 
         butil.put_in_collection(list(butil.iter_object_tree(window)), col)
 

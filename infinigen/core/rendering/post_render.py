@@ -24,6 +24,68 @@ from matplotlib import pyplot as plt
 logger = logging.getLogger(__name__)
 
 
+_REORIENT_REFERENCE_C2W = np.array(
+    [[-1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+    dtype=np.float64,
+)
+
+
+def _get_relative_yaw_deg(c2w_1: np.ndarray, c2w_2: np.ndarray) -> float:
+    R1 = c2w_1[:3, :3]
+    R2 = c2w_2[:3, :3]
+
+    R_rel = R1.T @ R2
+
+    pitch = np.arcsin(np.clip(R_rel[1, 2], -1.0, 1.0))
+    if np.abs(np.cos(pitch)) > 1e-6:
+        yaw = np.arctan2(-R_rel[0, 2], R_rel[2, 2])
+    else:
+        yaw = 0.0
+
+    return float(np.degrees(yaw))
+
+
+def roll_normals_equirect(normals: np.ndarray, shift_x: float) -> np.ndarray:
+    if normals.ndim != 3:
+        raise ValueError(f"Expected normals to have 3 dims (H,W,3 or 3,H,W), got {normals.shape}")
+
+    if normals.shape[-1] == 3:
+        normals_chw = np.moveaxis(normals, -1, 0)
+        moved_axis = True
+    elif normals.shape[0] == 3:
+        normals_chw = normals
+        moved_axis = False
+    else:
+        raise ValueError(f"Expected last or first dim to be 3, got {normals.shape}")
+
+    _, H, W = normals_chw.shape
+
+    angle = -2.0 * np.pi * shift_x
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    R = np.array(
+        [[cos_a, 0.0, -sin_a], [0.0, 1.0, 0.0], [sin_a, 0.0, cos_a]],
+        dtype=normals_chw.dtype,
+    )
+
+    n_flat = normals_chw.reshape(3, -1)
+    rotated = (R @ n_flat).reshape(3, H, W)
+    if moved_axis:
+        return np.moveaxis(rotated, 0, -1)
+    return rotated
+
+
+def reorient_surface_normals_from_camview(
+    surface_normals: np.ndarray, camview_T: np.ndarray
+) -> np.ndarray:
+    if camview_T.shape != (4, 4):
+        raise ValueError(f"Expected camview_T shape (4,4), got {camview_T.shape}")
+
+    # Match the convention used in reorient_normals.py: convert Blender C2W to an OpenCV-like frame.
+    yaw_deg = _get_relative_yaw_deg(camview_T, _REORIENT_REFERENCE_C2W)
+    shift_x = yaw_deg / 360.0
+    return roll_normals_equirect(surface_normals, -shift_x)
+
+
 def load_exr(path):
     assert Path(path).exists() and Path(path).suffix == ".exr", path
     return cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)

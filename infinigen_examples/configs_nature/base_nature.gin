@@ -5,7 +5,7 @@ compose_nature.inview_distance = 70
 compose_nature.near_distance = 20
 compose_nature.center_distance = 35
 
-camera.spawn_camera_rigs.n_camera_rigs = 1
+camera.spawn_camera_rigs.n_camera_rigs = 6
 
 compose_nature.land_domain_tags = 'landscape,-liquid_covered,-cave,-beach'
 compose_nature.nonliving_domain_tags = 'landscape,-cave'

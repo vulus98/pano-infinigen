@@ -29,6 +29,7 @@ from infinigen.core.rendering.post_render import (
     load_depth,
     load_flow,
     load_normals,
+    reorient_surface_normals_from_camview,
     load_seg_mask,
     load_uniq_inst,
 )
@@ -290,7 +291,7 @@ def global_flat_shading():
         nw.links.remove(link)
 
 
-def postprocess_blendergt_outputs(frames_folder, output_stem):
+def postprocess_blendergt_outputs(frames_folder, output_stem, camview_T=None):
     # # Save flow visualization
     flow_dst_path = frames_folder / f"Vector{output_stem}.exr"
     # flow_array = load_flow(flow_dst_path)
@@ -307,6 +308,9 @@ def postprocess_blendergt_outputs(frames_folder, output_stem):
     # Save surface normal visualization
     normal_dst_path = frames_folder / f"Normal{output_stem}.exr"
     normal_array = load_normals(normal_dst_path)
+
+    normal_array = reorient_surface_normals_from_camview(normal_array, camview_T)
+
     normal_array_reduced = normal_array.astype(np.float16)
     np.save(flow_dst_path.with_name(f"SurfaceNormal{output_stem}.npy"), normal_array_reduced)
     imwrite(
@@ -503,7 +507,11 @@ def render_image(
             if flat_shading:
                 bpy.context.scene.frame_set(frame)
                 suffix = get_suffix(dict(frame=frame, **indices))
-                postprocess_blendergt_outputs(frames_folder, suffix)
+                postprocess_blendergt_outputs(
+                    frames_folder,
+                    suffix,
+                    camview_T=np.asarray(camera.matrix_world, dtype=np.float64),
+                )
             else:
                 cam_util.save_camera_parameters(
                     camera,

@@ -1,6 +1,6 @@
 iterate_scene_tasks.frame_range=[0,0]
 iterate_scene_tasks.render_frame_range=[0,0]
-iterate_scene_tasks.n_camera_rigs = 6
+iterate_scene_tasks.n_camera_rigs = 1
 iterate_scene_tasks.n_subcams = 1
 
 iterate_scene_tasks.global_tasks = [

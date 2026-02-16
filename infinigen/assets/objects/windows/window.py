@@ -83,7 +83,7 @@ class WindowFactory(AssetFactory):
             self.beveler = BevelSharp()
             self.open = open
             self.curtain = curtain
-            self.shutter = shutter
+            self.shutter = None
         self.params.update(self.material_params)
 
     @staticmethod
@@ -116,7 +116,7 @@ class WindowFactory(AssetFactory):
         if open is None:
             open = U(0, 1) < 0.5
         if shutter is None:
-            shutter = U(0, 1) < 0.2
+            shutter = U(0, 1) < 0.0
         if curtain is None:
             curtain = U(0, 1) < 0.3
         if curtain:
@@ -291,7 +291,7 @@ def nodegroup_window_geometry(nw: NodeWrangler):
             ("NodeSocketFloat", "CurtainFrameRadius", 0.0100),
             ("NodeSocketFloat", "CurtainMidL", -0.5000),
             ("NodeSocketFloat", "CurtainMidR", 0.5000),
-            ("NodeSocketBool", "Shutter", True),
+            ("NodeSocketBool", "Shutter", False),
             ("NodeSocketFloat", "ShutterPanelRadius", 0.0050),
             ("NodeSocketFloat", "ShutterWidth", 0.0500),
             ("NodeSocketFloat", "ShutterThickness", 0.0050),

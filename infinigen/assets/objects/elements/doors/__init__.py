@@ -19,10 +19,10 @@ def random_door_factory():
     door_factories = [
         PanelDoorFactory,
         GlassPanelDoorFactory,
-        LouverDoorFactory,
         LiteDoorFactory,
     ]
-    door_probs = np.array([4, 2, 3, 3])
+    door_probs = np.array([4, 2, 3])
+
     return np.random.choice(door_factories, p=door_probs / door_probs.sum())
 
 
