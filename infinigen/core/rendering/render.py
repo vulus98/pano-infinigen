@@ -327,12 +327,10 @@ def postprocess_blendergt_outputs(frames_folder, output_stem, camview_T=None):
     # imwrite(
     #     depth_dst_path.with_name(f"Depth{output_stem}_raw.png"), colorize_depth(depth_array_reduced)
     # )
-    depth_array_clipped = np.clip(depth_array_reduced, 1, 75)
-    depth_array_log = np.log(depth_array_clipped + 1e-6)
-    depth_array_log = depth_array_log.astype(np.float16)
+    depth_array_clipped = np.clip(depth_array_reduced, 1e-6, 75)
     
-    np.save(flow_dst_path.with_name(f"Depth{output_stem}.npy"), depth_array_log)
-    depth_array_log = depth_array_log + 1e-2
+    np.save(flow_dst_path.with_name(f"Depth{output_stem}.npy"), depth_array_clipped)
+    depth_array_log = np.log(depth_array_clipped)
     imwrite(
         depth_dst_path.with_name(f"Depth{output_stem}.png"), colorize_depth(depth_array_log)
     )
