@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 #SBATCH --job-name=pano-infinigen-array
-#SBATCH --array=1-8`000
+#SBATCH --array=1-10000
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem-per-cpu=4G
@@ -12,6 +12,9 @@
 
 # Default to outdoor if SCENE_TYPE is not provided
 SCENE_TYPE=${SCENE_TYPE:-outdoor}
+
+source  ~/miniconda3/etc/profile.d/conda.sh
+conda activate infinigen
 
 echo "$(date) start ${SLURM_JOB_ID} - Mode: ${SCENE_TYPE}"
 

@@ -1,138 +1,130 @@
 import os
 import random
+import argparse
 from pathlib import Path
 from PIL import Image
-from datasets import Dataset, DatasetDict, Features, Image as HfImage, Value
-from huggingface_hub import login
+from datasets import Dataset, Features, Image as HfImage, Value
+from huggingface_hub import login, HfApi, list_repo_files
 
 # --- Configuration ---
 BASE_DIR = "outputs"
-REPO_ID = "prs-eth/Pano-Infinigen"  # Ensure this matches your target repo
-HF_TOKEN = os.environ.get("HF_TOKEN") # Best practice: Use an environment variable
+REPO_ID = "prs-eth/PanoInfinigen"
+HF_TOKEN = os.environ.get("HF_TOKEN")
+CHUNK_SIZE = 15 
 
-def get_id1_splits(scene_dir, train_pct=0.8, val_pct=0.1):
-    """Gathers all id_1 folders and rigidly splits them into train/val/test."""
-    if not scene_dir.exists():
-        return [], [], []
-        
-    id1_paths = [d for d in scene_dir.iterdir() if d.is_dir()]
-    id1_names = [d.name for d in id1_paths]
-    
-    # Sort and seed for exact reproducibility across runs
-    id1_names.sort() 
+CONFIG_MAPPING = {
+    "indoor": "indoor",
+    "outdoor": "nature"
+}
+
+def get_args():
+    parser = argparse.ArgumentParser(description="Resumable HF Upload")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--cpus", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 8)))
+    return parser.parse_args()
+
+# ... (get_id1_splits, get_paths_for_ids, process_and_load remain the same) ...
+
+def get_id1_splits(scene_dir, train_pct=0.85, val_pct=0.075, debug=False):
+    if not scene_dir.exists(): return [], [], []
+    id1_names = sorted([d.name for d in scene_dir.iterdir() if d.is_dir()])
     random.seed(42)
     random.shuffle(id1_names)
-    
+    if debug: return id1_names[:2], id1_names[2:3], id1_names[3:4]
     n_total = len(id1_names)
     n_train = int(n_total * train_pct)
     n_val = int(n_total * val_pct)
-    
-    train_ids = id1_names[:n_train]
-    val_ids = id1_names[n_train:n_train + n_val]
-    test_ids = id1_names[n_train + n_val:]
-    
-    return train_ids, val_ids, test_ids
+    return id1_names[:n_train], id1_names[n_train:n_train+n_val], id1_names[n_train+n_val:]
 
-def generate_examples(base_dir, target_scene, allowed_id1s):
-    """Yields valid triplets ONLY if their id_1 is in the allowed list."""
-    allowed_set = set(allowed_id1s) 
-    
-    scene_dir = Path(base_dir) / target_scene
-    if not scene_dir.exists():
-        return
-
-    for id1_dir in scene_dir.iterdir():
-        if not id1_dir.is_dir() or id1_dir.name not in allowed_set: 
-            continue # Skip if this id_1 belongs to a different split
-            
-        for id2_dir in id1_dir.iterdir():
-            if not id2_dir.is_dir(): continue
-            
-            camera_dir = id2_dir / "frames"
-            img_dir = camera_dir / "Image" / "camera_0"
-            depth_dir = camera_dir / "Depth" / "camera_0"
-            normal_dir = camera_dir / "SurfaceNormal" / "camera_0"
-            
+def get_paths_for_ids(base_dir, target_scene, ids):
+    paths = []
+    scene_path = Path(base_dir) / target_scene
+    for id1_name in ids:
+        id1_dir = scene_path / id1_name
+        for id2 in id1_dir.iterdir():
+            if not id2.is_dir(): continue
+            img_dir = id2 / "frames" / "Image" / "camera_0"
             if not img_dir.exists(): continue
-            
-            for img_path in img_dir.glob("Image_*.png"):
-                suffix = img_path.stem.replace("Image_", "")
-                
-                depth_path = depth_dir / f"Depth_{suffix}.npy"
-                normal_path = normal_dir / f"SurfaceNormal_{suffix}.npy"
-                
-                if depth_path.exists() and normal_path.exists():
-                    try:
-                        with open(depth_path, "rb") as f_depth: depth_bytes = f_depth.read()
-                        with open(normal_path, "rb") as f_normal: normal_bytes = f_normal.read()
+            for img_p in img_dir.glob("Image_*.png"):
+                suffix = img_p.stem.replace("Image_", "")
+                depth_p = id2 / "frames" / "Depth" / "camera_0" / f"Depth_{suffix}.npy"
+                norm_p = id2 / "frames" / "SurfaceNormal" / "camera_0" / f"SurfaceNormal_{suffix}.npy"
+                if depth_p.exists() and norm_p.exists():
+                    paths.append({"image_path": str(img_p), "depth_path": str(depth_p), "normals_path": str(norm_p)})
+    return paths
 
-                        # CLEANED OUTPUT: No IDs or suffixes included
-                        yield {
-                            "image": Image.open(img_path).convert("RGB"),
-                            "depth": depth_bytes,
-                            "normals": normal_bytes,
-                        }
-                    except Exception:
-                        pass # Silently skip corrupted files
+def process_and_load(batch):
+    images = [Image.open(p).convert("RGB") for p in batch["image_path"]]
+    depths = [Path(p).read_bytes() for p in batch["depth_path"]]
+    normals = [Path(p).read_bytes() for p in batch["normals_path"]]
+    return {"image": images, "depth": depths, "normals": normals}
 
 if __name__ == "__main__":
-    # Log in using the token from your environment or replace with a fresh token string
-    if HF_TOKEN:
-        login(token=HF_TOKEN)
-    else:
-        print("Warning: HF_TOKEN not found in environment.")
+    args = get_args()
+    api = HfApi()
+    if HF_TOKEN: login(token=HF_TOKEN)
+    
+    # 1. Get a list of all files currently on the Hub to enable skipping
+    print("Fetching existing file list from Hugging Face...")
+    try:
+        existing_files = list_repo_files(REPO_ID, repo_type="dataset")
+    except Exception:
+        existing_files = []
 
-    # CLEANED SCHEMA: Define only the columns you want to see on the Hub
-    features = Features({
-        "image": HfImage(),
-        "depth": Value("binary"),
-        "normals": Value("binary"),
-    })
+    scratch_dir = Path(os.environ.get("HF_DATASETS_CACHE", "./hf_cache"))
+    features = Features({"image": HfImage(), "depth": Value("binary"), "normals": Value("binary")})
 
-    # Loop through both configurations
-    for scene_type in ["indoor", "outdoor"]:
-        print(f"\n--- Processing Config: {scene_type.upper()} ---")
-        scene_dir = Path(BASE_DIR) / scene_type
-        
-        # 1. Calculate the id_1 groupings first
-        train_ids, val_ids, test_ids = get_id1_splits(scene_dir)
-        
-        split_mappings = {
-            "train": train_ids,
-            "val": val_ids,
-            "test": test_ids
-        }
-        
-        dataset_splits = {}
-        
-        # 2. Build a specific Dataset for each split
-        for split_name, allowed_ids in split_mappings.items():
-            if not allowed_ids:
-                print(f"Skipping {split_name} split (not enough id_1s).")
-                continue
-                
-            print(f"Building {split_name} split ({len(allowed_ids)} unique id_1 locations)...")
+    for local_folder, hf_config in CONFIG_MAPPING.items():
+        scene_dir = Path(BASE_DIR) / local_folder
+        splits = get_id1_splits(scene_dir, debug=args.debug)
+        split_names = ["train", "val", "test"]
+
+        for split_name, all_ids in zip(split_names, splits):
+            if not all_ids: continue
             
-            split_dataset = Dataset.from_generator(
-                generate_examples,
-                gen_kwargs={
-                    "base_dir": BASE_DIR, 
-                    "target_scene": scene_type,
-                    "allowed_id1s": allowed_ids
-                },
-                features=features
-            )
-            
-            if len(split_dataset) > 0:
-                dataset_splits[split_name] = split_dataset
-                print(f"  -> {len(split_dataset)} total frames added.")
+            for i in range(0, len(all_ids), CHUNK_SIZE):
+                chunk_idx = i // CHUNK_SIZE
+                config_label = f"{hf_config}-debug" if args.debug else hf_config
+                parquet_filename = f"{split_name}-{chunk_idx:05d}.parquet"
+                path_in_repo = f"data/{config_label}/{parquet_filename}"
 
-        # 3. Combine into DatasetDict and push
-        if dataset_splits:
-            dataset_dict = DatasetDict(dataset_splits)
-            print(f"Pushing '{scene_type}' config to HF Hub...")
-            dataset_dict.push_to_hub(REPO_ID, config_name=scene_type)
-        else:
-            print(f"No valid data found to push for {scene_type}.")
+                # 2. SKIP LOGIC: If file exists, don't even scan the disk
+                if path_in_repo in existing_files:
+                    print(f"Skipping {path_in_repo} (Already on Hub)")
+                    continue
 
-    print("\nAll done! You have a clean, visual-only dataset on HF.")
+                print(f"\n[{hf_config}][{split_name}] Processing Chunk {chunk_idx + 1}...")
+                chunk_ids = all_ids[i : i + CHUNK_SIZE]
+                paths = get_paths_for_ids(BASE_DIR, local_folder, chunk_ids)
+                if not paths: continue
+
+                path_ds = Dataset.from_list(paths)
+                processed_ds = path_ds.map(
+                    process_and_load,
+                    batched=True,
+                    batch_size=12,
+                    num_proc=args.cpus,
+                    remove_columns=["image_path", "depth_path", "normals_path"],
+                    features=features,
+                    keep_in_memory=False
+                )
+
+                local_parquet_path = scratch_dir / parquet_filename
+                processed_ds.to_parquet(str(local_parquet_path))
+
+                print(f"[{hf_config}] Uploading {parquet_filename}...")
+                api.upload_file(
+                    path_or_fileobj=str(local_parquet_path),
+                    path_in_repo=path_in_repo,
+                    repo_id=REPO_ID,
+                    repo_type="dataset",
+                )
+
+                # Cleanup
+                if local_parquet_path.exists(): os.remove(local_parquet_path)
+                processed_ds.cleanup_cache_files()
+                for p in scratch_dir.glob("*.arrow"):
+                    try: os.remove(p)
+                    except: pass
+
+    print("\nUpload sequence resumed and completed.")
