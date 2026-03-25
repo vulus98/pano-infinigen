@@ -27,7 +27,6 @@ from infinigen.core.rendering.post_render import (
     colorize_int_array,
     colorize_normals,
     load_depth,
-    load_flow,
     load_normals,
     reorient_surface_normals_from_camview,
     load_seg_mask,
@@ -213,12 +212,42 @@ def configure_compositor_output(
                 )
                 nw.links.new(comnbine_color.outputs[0], slot_input)
             case "normal":
-                color = nw.new_node(
-                    Nodes.CompositorMixRGB,
-                    [None, render_socket, (0, 0, 0, 0)],
-                    attrs={"blend_type": "ADD"},
-                ).outputs[0]
-                nw.links.new(color, slot_input)
+                if default_file_output_node.name == file_output_node_png.name:
+                    add_one = nw.new_node(
+                        Nodes.CompositorMixRGB,
+                        [None, render_socket, (1, 1, 1, 1)],
+                        attrs={"blend_type": "ADD"},
+                    ).outputs[0]
+                    color = nw.new_node(
+                        Nodes.CompositorMixRGB,
+                        [None, add_one, (0.5, 0.5, 0.5, 1)],
+                        attrs={"blend_type": "MULTIPLY"},
+                    ).outputs[0]
+                    # Alpha 1.0
+                    set_alpha = nw.new_node("CompositorNodeSetAlpha")
+                    nw.links.new(color, set_alpha.inputs[0])
+                    set_alpha.inputs[1].default_value = 1.0 # Ensure opacity
+                    nw.links.new(set_alpha.outputs[0], slot_input)
+                    
+                    # ALSO save Raw Normals to EXR
+                    # For EXR we usually want raw [-1, 1] or maybe [0, 1].
+                    # Let's save RAW [-1, 1] as it preserves full precision and direction.
+                    exr_socket = file_output_node_exr.file_slots.new(socket_name)
+                    nw.links.new(render_socket, exr_socket)
+                    file_slot_list.append(file_output_node_exr.file_slots[exr_socket.name])
+                else:
+                    color = nw.new_node(
+                        Nodes.CompositorMixRGB,
+                        [None, render_socket, (0, 0, 0, 0)],
+                        attrs={"blend_type": "ADD"},
+                    ).outputs[0]
+                    nw.links.new(color, slot_input)
+            case "z":
+                nw.links.new(render_socket, slot_input)
+                if default_file_output_node.name == file_output_node_png.name:
+                    exr_socket = file_output_node_exr.file_slots.new(socket_name)
+                    nw.links.new(render_socket, exr_socket)
+                    file_slot_list.append(file_output_node_exr.file_slots[exr_socket.name])
             case _:
                 nw.links.new(render_socket, slot_input)
         file_slot_list.append(file_output_node.file_slots[slot_input.name])
@@ -481,6 +510,8 @@ def render_image(
     ## Update output names
     fileslot_suffix = get_suffix({"frame": "####", **indices})
     for file_slot in file_slot_nodes:
+        if not hasattr(file_slot, "path"):
+            continue
         file_slot.path = f"{file_slot.path}{fileslot_suffix}"
 
     if use_dof == "IF_TARGET_SET":

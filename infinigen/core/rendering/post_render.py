@@ -9,6 +9,7 @@ import logging
 import os
 
 import OpenEXR
+import Imath # Needed for robust EXR loading
 
 # ruff: noqa: E402
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"  # This must be done BEFORE import cv2.
@@ -87,14 +88,47 @@ def reorient_surface_normals_from_camview(
 
 
 def load_exr(path):
-    assert Path(path).exists() and Path(path).suffix == ".exr", path
-    return cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+    path = str(path)
+    if not (Path(path).exists() and Path(path).suffix == ".exr"):
+        raise ValueError(f"Invalid EXR path: {path}")
 
+    # Robust loading using OpenEXR if possible
+    try:
+        import OpenEXR
+        import Imath
+        exr_file = OpenEXR.InputFile(path)
+        header = exr_file.header()
+        dw = header['dataWindow']
+        width = dw.max.x - dw.min.x + 1
+        height = dw.max.y - dw.min.y + 1
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        
+        channels = header['channels'].keys()
+        
+        # Decide which channels to read (Normal maps are often XYZ, Colors RGB)
+        # We want to emulate OpenCV's BGR return format if possible for consistency
+        C = []
+        if 'R' in channels and 'G' in channels and 'B' in channels:
+            # Return BGR
+            C = ['B', 'G', 'R']
+        elif 'X' in channels and 'Y' in channels and 'Z' in channels:
+            # Normals: Typically mapped to RGB. 
+            C = ['Z', 'Y', 'X'] 
+        else:
+            # Fallback to OpenCV standard
+            return cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
 
-load_flow = load_exr
+        arrs = [np.frombuffer(exr_file.channel(c, pt), dtype=np.float32).reshape(height, width) for c in C]
+        return np.dstack(arrs)
+
+    except Exception as e:
+        logger.warning(f"OpenEXR direct load failed ({e}), falling back to OpenCV for {path}")
+        return cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
 
 
 def load_single_channel(p):
+    import OpenEXR
+    import Imath
     file = OpenEXR.InputFile(str(p))
     channel, channel_type = next(iter(file.header()["channels"].items()))
     match str(channel_type.type):
@@ -113,6 +147,13 @@ def load_depth(p):
 
 
 def load_normals(p):
+    # Depending on how load_exr reads channels, this reordering is important
+    # If load_exr returns BGR (Z, Y, X), then:
+    # 2 -> X
+    # 0 -> Z
+    # 1 -> Y
+    # load_exr(p)[..., [2, 0, 1]] -> [X, Z, Y]
+    # * [-1, 1, 1] -> [-X, Z, Y]
     return load_exr(p)[..., [2, 0, 1]] * np.array([-1.0, 1.0, 1.0])
 
 
