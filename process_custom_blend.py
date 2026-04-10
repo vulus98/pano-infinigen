@@ -1,16 +1,65 @@
 import argparse
+import contextlib
+import logging
 import sys
+import time
 from pathlib import Path
 
 # Use the environment variable for OpenCV EXR support BEFORE cv2 import
 import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+def _phase(name: str):
+    logger.info(f"=== PHASE: {name} ===")
+    return time.perf_counter()
+
+def _phase_done(name: str, t0: float):
+    logger.info(f"=== DONE: {name} ({time.perf_counter() - t0:.1f}s) ===")
+
+
+@contextlib.contextmanager
+def suppress_blender_output():
+    """Redirect both stdout AND stderr at the fd level to silence Blender C-level noise.
+
+    Blender's internal logging can go to either fd depending on the build.
+    Python's print() is rerouted through a saved copy of the original stdout
+    so our own messages still appear.
+    """
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+
+    # Redirect both fds to /dev/null (catches all C-level output)
+    os.dup2(devnull_fd, 1)
+    os.dup2(devnull_fd, 2)
+
+    # Make Python's print() write to the saved original stdout
+    py_out = os.fdopen(saved_stdout_fd, 'w', closefd=False)
+    old_sys_stdout = sys.stdout
+    sys.stdout = py_out
+
+    try:
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stdout = old_sys_stdout
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+        os.close(devnull_fd)
+
 import bpy
 import numpy as np
 import gin
 from mathutils import Vector
-import cv2
 import imageio
 
 # Add root to sys.path so we can import infinigen
@@ -24,18 +73,204 @@ from infinigen.core.rendering import render
 from infinigen.core.util import blender as butil
 
 # Specific post-processing tools requested by user
-from infinigen.core.rendering.post_render import load_normals, reorient_surface_normals_from_camview, colorize_normals, load_depth, colorize_depth
+from infinigen.core.rendering.post_render import load_normals, reorient_surface_normals_from_camview, colorize_normals, load_depth, colorize_depth, load_exr
 from infinigen.tools.suffixes import get_suffix
 
+def _register_icity_addon():
+    """Register the iCity addon so its PropertyGroups are available before opening a city .blend file."""
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import iCity as _icity
+    _icity.register()
+    print("iCity addon registered.")
+    return script_dir
+
+
+def _remap_icity_libraries(script_dir: Path):
+    """After opening a city .blend, fix any library paths that point to the
+    original machine, then reload the linked data so it actually populates
+    (without remapping + reload, only the first/main object tree appears)."""
+    theme_dir = script_dir / "iCity - Default Theme"
+    remapped_libs = []
+    for lib in bpy.data.libraries:
+        lib_abs = Path(bpy.path.abspath(lib.filepath))
+        if not lib_abs.exists():
+            matches = list(theme_dir.rglob(lib_abs.name))
+            if matches:
+                lib.filepath = str(matches[0])
+                print(f"Remapped library: {lib_abs.name} -> {matches[0]}")
+                remapped_libs.append(lib)
+            else:
+                print(f"Warning: Could not find library asset: {lib_abs.name}")
+
+    if not remapped_libs:
+        return
+
+    # Disable Blender's library override auto-resync. On iCity .blend files
+    # this resync runs for minutes and emits thousands of dependency-loop
+    # warnings; we don't need overrides to be re-synced for headless rendering.
+    try:
+        prefs = bpy.context.preferences
+        if hasattr(prefs, "experimental") and hasattr(prefs.experimental, "no_override_auto_resync"):
+            prefs.experimental.no_override_auto_resync = True
+            print("Disabled override auto-resync for fast library reload.")
+    except Exception as e:
+        print(f"Note: could not disable override auto-resync ({e}); reload may be slow.")
+
+    # Reload each remapped library so its actual data (objects, meshes,
+    # materials, ...) gets pulled into the scene. Without this, only the
+    # main file's local data is visible — linked collections appear empty.
+    for lib in remapped_libs:
+        try:
+            lib.reload()
+            print(f"Reloaded library: {Path(lib.filepath).name}")
+        except Exception as e:
+            print(f"Warning: Could not reload {lib.filepath}: {e}")
+
+
+def _force_lights_off():
+    """Force daytime mode on all iCity objects.
+
+    bpy 4.5 drops the saved boolean values from iCity's GeometryNodes modifier
+    sockets when loading 4.4-saved files. The geometry node defaults leave
+    building lights ON. We explicitly set both 'Light Mode' and 'Lights On'
+    inputs to False on every relevant object — same mechanism iCity's own
+    set_mode() uses internally.
+    """
+    # The file was saved with Blender 5.1 but we run bpy 4.5. The socket
+    # type system changed between versions, so setting modifier properties
+    # via mod[identifier] is silently ignored ("Property type does not match
+    # input socket"). Instead we patch the node group's own default_value
+    # for each socket — that IS what Blender falls back to when the modifier
+    # property doesn't match.
+    sockets_to_force_false = ["Light Mode", "Lights On"]
+    patched = set()
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        for mod in obj.modifiers:
+            if mod.type != 'NODES' or mod.node_group is None:
+                continue
+            ng = mod.node_group
+            if ng.name in patched:
+                continue
+            for socket_name in sockets_to_force_false:
+                try:
+                    item = ng.interface.items_tree[socket_name]
+                    item.default_value = False
+                    print(f"Patched node group '{ng.name}' socket '{socket_name}' default = False")
+                    patched.add(ng.name)
+                except (KeyError, AttributeError):
+                    pass
+
+    # 3. Disable all emission in materials (belt and suspenders)
+    n_emission_zeroed = 0
+    for mat in bpy.data.materials:
+        if not mat.use_nodes or mat.node_tree is None:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type == 'EMISSION':
+                if 'Strength' in node.inputs:
+                    node.inputs['Strength'].default_value = 0.0
+                    n_emission_zeroed += 1
+            elif node.type == 'BSDF_PRINCIPLED':
+                if 'Emission Strength' in node.inputs:
+                    node.inputs['Emission Strength'].default_value = 0.0
+                    n_emission_zeroed += 1
+    print(f"Zeroed emission on {n_emission_zeroed} shader nodes")
+
+    # 4. Hide / zero all actual light objects
+    n_lights = 0
+    for obj in bpy.data.objects:
+        if obj.type == 'LIGHT':
+            obj.hide_render = True
+            obj.hide_viewport = True
+            try:
+                obj.data.energy = 0.0
+            except Exception:
+                pass
+            n_lights += 1
+    print(f"Disabled {n_lights} light objects")
+
+    # 5. Flip iCity's own property toggles for good measure
+    main_props = getattr(bpy.context.scene, "parametra_icity_main", None)
+    if main_props is not None:
+        for prop in ("night_mode", "light_mode"):
+            if hasattr(main_props, prop):
+                try:
+                    setattr(main_props, prop, False)
+                except Exception:
+                    pass
+
+
+def _setup_hdri_world(input_blend: Path, script_dir: Path):
+    """Set up world environment lighting from an HDRI file alongside the input blend."""
+    # Search for an HDRI in: same dir as blend, then script dir
+    candidates = []
+    blend_dir = input_blend.resolve().parent
+    for d in (blend_dir, script_dir):
+        candidates += list(d.glob("*.hdr")) + list(d.glob("*.exr"))
+
+    if not candidates:
+        print("No HDRI (.hdr/.exr) found next to the input blend; skipping environment lighting.")
+        return
+
+    hdri_path = candidates[0]
+    print(f"Loading HDRI environment: {hdri_path}")
+
+    # Get or create a world
+    world = bpy.context.scene.world
+    if world is None:
+        world = bpy.data.worlds.new("World")
+        bpy.context.scene.world = world
+
+    world.use_nodes = True
+    nt = world.node_tree
+    nt.nodes.clear()
+
+    out_node = nt.nodes.new("ShaderNodeOutputWorld")
+    bg_node = nt.nodes.new("ShaderNodeBackground")
+    env_node = nt.nodes.new("ShaderNodeTexEnvironment")
+
+    env_node.image = bpy.data.images.load(str(hdri_path), check_existing=True)
+    bg_node.inputs["Strength"].default_value = 1.0
+
+    nt.links.new(env_node.outputs["Color"], bg_node.inputs["Color"])
+    nt.links.new(bg_node.outputs["Background"], out_node.inputs["Surface"])
+
+    # Layout (cosmetic, harmless headless)
+    env_node.location = (-400, 0)
+    bg_node.location = (-150, 0)
+    out_node.location = (100, 0)
+
+
 def main(args):
-    # 1. Load the custom blend file
-    # We do this BEFORE init/gin because gin might set scene properties
-    if not args.input_blend.exists():
-        raise FileNotFoundError(f"{args.input_blend} does not exist")
-    
-    print(f"Loading {args.input_blend}...")
-    bpy.ops.wm.open_mainfile(filepath=str(args.input_blend))
-    
+    # 1. Resolve city directory and discover files
+    city_dir = args.city_dir.resolve()
+    if not city_dir.is_dir():
+        raise FileNotFoundError(f"City directory {city_dir} does not exist")
+
+    # Find the .blend file
+    blend_files = list(city_dir.glob("*.blend"))
+    if not blend_files:
+        raise FileNotFoundError(f"No .blend file found in {city_dir}")
+    input_blend = blend_files[0]
+    print(f"Using blend file: {input_blend}")
+
+    # Output goes to outputs/urban/<city_dir_name>/
+    output_folder = Path("outputs/urban") / city_dir.name
+    output_folder.mkdir(parents=True, exist_ok=True)
+    print(f"Output folder: {output_folder}")
+
+    # Register iCity addon so its PropertyGroups exist when Blender deserializes the scene
+    script_dir = _register_icity_addon()
+
+    t0 = _phase("load blend file")
+    bpy.ops.wm.open_mainfile(filepath=str(input_blend), load_ui=False)
+    _remap_icity_libraries(script_dir)
+    _phase_done("load blend file", t0)
+
     # Ensure any stuck material override is cleared immediately
     if "ViewLayer" in bpy.context.scene.view_layers:
         bpy.context.scene.view_layers["ViewLayer"].material_override = None
@@ -43,102 +278,162 @@ def main(args):
     # Ensure we use Cycles
     bpy.context.scene.render.engine = 'CYCLES'
 
+    # HDRI environment lighting is already embedded in the .blend file;
+    # no need to override it from an external file.
+
+    # Force iCity night-mode lights off (bpy 4.5 drops the saved False values)
+    _force_lights_off()
+
     # 2. Apply configs
     # This sets up rendering settings, camera parameters etc on the loaded scene
-    print("Applying gin configs...")
+    t0 = _phase("apply gin configs")
     init.apply_gin_configs(
         config_folders=[
-            Path("infinigen/datagen/configs"), 
-            Path("infinigen_examples/configs_nature"), 
+            Path("infinigen/datagen/configs"),
+            Path("infinigen_examples/configs_nature"),
             Path("infinigen_examples/configs_indoor")
         ],
         configs=args.configs,
         overrides=args.overrides,
         skip_unknown=True
     )
+    _phase_done("apply gin configs", t0)
+
+    # Explicitly set camera rotation to (90, 0, random_yaw)
+    # This overrides any settings from the config files
+    print("Overriding camera rotation to (90, 0, random_yaw)...")
+    # pitch=90 creates a horizontal view (looking out at the horizon)
+    gin.bind_parameter("infinigen.core.placement.camera.camera_pose_proposal.pitch", 90)
+    # roll=0 ensures the camera is level
+    gin.bind_parameter("infinigen.core.placement.camera.camera_pose_proposal.roll", 0)
+    # yaw is randomized 360 degrees
+    gin.bind_parameter("infinigen.core.placement.camera.camera_pose_proposal.yaw", ("uniform", -180, 180))
+    # Altitude: 1-3m above ground
+    gin.bind_parameter("infinigen.core.placement.camera.camera_pose_proposal.altitude", ("uniform", 2, 4))
 
     # 3. Find floor level (min Z)
-    # min_z = float('inf')
-    # mesh_objs = [o for o in bpy.data.objects if o.type == 'MESH']
-    
-    # # Calculate scene bounds to sample from
-    # all_points = []
-    
-    # for obj in mesh_objs:
-    #     # Check world coordinates
-    #     mw = obj.matrix_world
-    #     # Bounding box corners in world space
-    #     if obj.bound_box:
-    #         bbox_corners = [mw @ Vector(corner) for corner in obj.bound_box]
-    #         for corner in bbox_corners:
-    #             if corner.z < min_z:
-    #                 min_z = corner.z
-    #             all_points.append(corner)
-            
-    # if not all_points:
-    #     # Fallback if empty scene
-    #     print("Warning: No mesh objects found. Using default bounds.")
-    #     min_z = 0
-    #     scene_bounds = (Vector((-10, -10, 0)), Vector((10, 10, 0)))
-    # else:
-    #     min_coords = np.min([v[:] for v in all_points], axis=0)
-    #     max_coords = np.max([v[:] for v in all_points], axis=0)
-    #     scene_bounds = (Vector(min_coords), Vector(max_coords))
+    # Only consider objects that are visible in render — hidden objects, culling
+    # volumes, and system helpers can have huge bounding boxes that inflate the
+    # scene bounds far beyond the actual city geometry.
+    # Use only known iCity city objects for bounds — random leftover objects,
+    # ground planes, and debug geometry inflate the bounds far beyond the city.
+    _CITY_OBJECTS = {
+        "Road", "Sidewalk", "Grid System", "Towers", "Parking",
+        "Parks", "Green Area", "Terraced frontend new", "Terraced backend new",
+    }
+    min_z = float('inf')
+    mesh_objs = [
+        o for o in bpy.data.objects
+        if o.type == 'MESH' and o.name in _CITY_OBJECTS
+    ]
 
-    floor_z = -0.1
-    print(f"Detected floor Z level: {floor_z}")
+    # Calculate scene bounds to sample from
+    all_points = []
+
+    for obj in mesh_objs:
+        # Check world coordinates
+        mw = obj.matrix_world
+        # Bounding box corners in world space
+        if obj.bound_box:
+            bbox_corners = [mw @ Vector(corner) for corner in obj.bound_box]
+            for corner in bbox_corners:
+                if corner.z < min_z:
+                    min_z = corner.z
+                all_points.append(corner)
+            
+    if not all_points:
+        # Fallback if empty scene
+        print("Warning: No mesh objects found. Using default bounds.")
+        min_z = 0
+        scene_bounds = (Vector((-10, -10, 0)), Vector((10, 10, 10)))
+    else:
+        min_coords = np.min([v[:] for v in all_points], axis=0)
+        max_coords = np.max([v[:] for v in all_points], axis=0)
+        # Take the central 20-80% in X and Y to sample from the city core
+        x_range = max_coords[0] - min_coords[0]
+        y_range = max_coords[1] - min_coords[1]
+        min_coords[0] += 0.2 * x_range
+        max_coords[0] -= 0.2 * x_range
+        min_coords[1] += 0.2 * y_range
+        max_coords[1] -= 0.2 * y_range
+        # Clamp Z to near ground level so altitude adjustment (1-3m) works correctly
+        min_coords[2] = 2.0
+        max_coords[2] = 4.0
+        scene_bounds = (Vector(min_coords), Vector(max_coords))
+
+    print(f"Scene bounds for sampling: {scene_bounds}")
+
+    # DEBUG: find which objects define each extreme of the bounding box
+    axis_names = ['X', 'Y', 'Z']
+    for axis in range(3):
+        for label, fn in [('min', min), ('max', max)]:
+            worst_obj = None
+            worst_val = float('inf') if label == 'min' else float('-inf')
+            for obj in mesh_objs:
+                if not obj.bound_box:
+                    continue
+                mw = obj.matrix_world
+                corners = [mw @ Vector(c) for c in obj.bound_box]
+                vals = [c[axis] for c in corners]
+                v = fn(vals)
+                if (label == 'min' and v < worst_val) or (label == 'max' and v > worst_val):
+                    worst_val = v
+                    worst_obj = obj.name
+            print(f"  {axis_names[axis]} {label} = {worst_val:.1f} from '{worst_obj}'")
 
     # 4. Spawn Camera Rig
     camera_rigs = cam_util.spawn_camera_rigs()
     if not camera_rigs:
         raise RuntimeError("Failed to spawn camera rigs")
 
-    # 5. Manual Camera Placement (for testing)
-    print("Using manual camera placement...")
-    
-    # Set your desired location and rotation here
-    # Example: 2m up, looking along Y axis (adjust based on your scene)
-    manual_loc = (-2.67, -0.3, 0.000673)  
-    manual_rot = (np.deg2rad(90), np.deg2rad(0), np.deg2rad(178))  # (pitch, roll, yaw) in radians
+    # 5. Automatic Camera Placement
+    # Use low resolution for the search phase (much faster raycasting)
+    search_res = (256, 256)
+    bpy.context.scene.render.resolution_x = search_res[0]
+    bpy.context.scene.render.resolution_y = search_res[1]
+    print(f"Using {search_res} for fast camera search...")
 
-    for rig in camera_rigs:
-        rig.location = manual_loc
-        rig.rotation_euler = manual_rot
-        print(f"Placed rig {rig.name} at {manual_loc} with rotation {manual_rot}")
-
-    # The automatic camera Configuration is commented out below:
-    """
-    # 5. Configure Cameras using Infinigen's search logic
-    print("Pre-processing scene for camera placement...")
-    
-    # Treat all mesh objects as potential obstacles/terrain for camera selection
-    scene_objs = [o for o in bpy.data.objects if o.type == 'MESH']
-    
+    # Only exclude enclosing culling volumes from the BVH — they form a box
+    # around the city that breaks the sky raycast. Everything else (Terrain,
+    # Islands, Plane, etc.) has real geometry that cameras can be inside.
+    scene_objs = [
+        o for o in bpy.data.objects
+        if o.type == 'MESH'
+        and not o.name.startswith("Culling")
+    ]
     scene_preprocessed = cam_util.camera_selection_preprocessing(
-        terrain=None, 
+        terrain=None,
         scene_objs=scene_objs,
-        tags_ratio={}, # Relax all tag requirements
-        ranges_ratio={}
+        tags_ratio={},
+        ranges_ratio={},
     )
-    
+
     print("Searching for optimal camera views...")
-    # NOTE: 'altitude' and 'pitch' are controlled by gin configs passed in args.overrides
-    # Default altitude is 1.5-2.5m, pitch is 90 deg (horizontal)
-    
     cam_util.configure_cameras(
         camera_rigs,
         scene_preprocessed=scene_preprocessed,
-        init_bounding_box=scene_bounds, # Search within the scene bounds
-        terrain_coverage_range=None, # DISABLE terrain coverage check entirely
-        min_terrain_distance=0.1, # Reduce min distance to avoid false positives
+        init_bounding_box=scene_bounds,
+        terrain_coverage_range=None,
+        min_terrain_distance=2.0,
     )
-    """
-    
+
+    # Print found camera positions
+    for i, rig in enumerate(camera_rigs):
+        loc = rig.location
+        rot = rig.rotation_euler
+        print(f"Camera rig {i}: loc=({loc.x:.2f}, {loc.y:.2f}, {loc.z:.2f}), "
+              f"rot_deg=({np.degrees(rot.x):.1f}, {np.degrees(rot.y):.1f}, {np.degrees(rot.z):.1f})")
+
+    # Setup Resolution & Clipping
+    render_res = (4096, 2048)
+    clip_start = 0.001
+
+
     # 6. Render
     # We render into a 'frames' subdirectory to compatible with Infinigen's folder structure logic
     # which expects to reorganize files from 'frames_folder' into 'frames_folder/../frames' or 'frames_folder/Type/...'
     # By using a 'frames' subfolder, we ensure consistent behavior.
-    frames_folder = args.output_folder / "frames"
+    frames_folder = output_folder / "frames"
     frames_folder.mkdir(parents=True, exist_ok=True)
     
     # Force single frame render
@@ -155,22 +450,26 @@ def main(args):
     render_res = (4096, 2048) 
     clip_start = 0.001
 
-    print(f"Rendering to {frames_folder}...")
+    t0 = _phase("render")
+    logger.info(f"Rendering to {frames_folder}...")
 
     # Ensure no material override is active
     if "ViewLayer" in bpy.context.scene.view_layers:
         bpy.context.scene.view_layers["ViewLayer"].material_override = None
 
-    for cam_rig in camera_rigs:
+    # Restore full resolution for rendering
+    bpy.context.scene.render.resolution_x = render_res[0]
+    bpy.context.scene.render.resolution_y = render_res[1]
+    print(f"Restored resolution to {render_res} for rendering...")
+
+    for rig_idx, cam_rig in enumerate(camera_rigs):
         for cam in cam_rig.children:
             cam.data.clip_start = clip_start
-            
-            # This renders Beauty RGB + Depth + Normals in one go
-            # NOTE: render_image() calls reorganize_old_framesfolder() at the end, 
-            # which moves files into subdirectories (e.g. Normal/camera_0/)
+            print(f"\n=== Rendering camera rig {rig_idx}/{len(camera_rigs)} ({cam.name}) ===")
+
             render.render_image(
-                frames_folder=frames_folder, 
-                camera=cam, 
+                frames_folder=frames_folder,
+                camera=cam,
                 passes_to_save=[('z', 'Depth'), ('normal', 'Normal')],
                 render_resolution_override=render_res
             )
@@ -236,18 +535,48 @@ def main(args):
             if depth_path.exists():
                 print(f"Post-processing depth: {depth_path}")
                 try:
-                    depth_arr = load_depth(str(depth_path))
-                    
-                    # Save Raw .npy (float32)
-                    np.save(depth_path.with_name(f"Depth{suffix}.npy"), depth_arr.astype(np.float32))
-                    
-                    # Save Visualization PNG (colorized or normalized)
-                    # colorize_depth maps 0-inf to color scale
-                    colored_depth = colorize_depth(depth_arr)
-                    imageio.imwrite(depth_path.with_name(f"Depth{suffix}.png"), colored_depth)
-                    
+                    depth_raw = load_depth(str(depth_path))
+
+                    # Clamp max depth to 125m (sky and far structures) for saving
+                    MAX_DEPTH = 125.0
+                    depth_clamped = np.clip(depth_raw, None, MAX_DEPTH)
+
+                    # Save clamped .npy (float32)
+                    np.save(depth_path.with_name(f"Depth{suffix}.npy"), depth_clamped.astype(np.float32))
+
+                    # Save log-depth visualization PNG with spectral colormap
+                    import matplotlib.cm as cm
+                    log_depth = np.log(np.clip(depth_clamped, 1e-6, None))
+                    log_depth = (log_depth - log_depth.min()) / (log_depth.max() - log_depth.min() + 1e-8)
+                    depth_colored = (cm.Spectral(1.0 - log_depth)[..., :3] * 255).astype(np.uint8)
+                    imageio.imwrite(depth_path.with_name(f"Depth{suffix}.png"), depth_colored)
+
                     # Clean up: Delete original EXR
                     depth_path.unlink()
+
+                    # Post-render clipping check using RAW (unclamped) depth
+                    # for instanced props (cars, bins, trees) that aren't in the BVH.
+                    # 1. Max depth < 2m → camera is fully enclosed in small geometry
+                    # 2. >5% of pixels < 0.5m → camera clips through a prop
+                    max_depth = float(np.max(depth_raw))
+                    clip_frac = float(np.mean(depth_raw < 0.5))
+                    sky_frac = float(np.mean(depth_raw > 1e4))
+                    reject_reason = None
+                    if max_depth < 2.0:
+                        reject_reason = f"max_depth={max_depth:.1f}m (enclosed)"
+                    elif clip_frac > 0.05:
+                        reject_reason = f"clip_frac={clip_frac:.2%} (inside prop)"
+                    elif sky_frac < 0.10:
+                        reject_reason = f"sky_frac={sky_frac:.2%} (not enough open sky)"
+                    if reject_reason:
+                        print(f"Rejecting camera {suffix}: {reject_reason}")
+                        for channel_dir in frames_folder.iterdir():
+                            if not channel_dir.is_dir():
+                                continue
+                            for f in channel_dir.rglob(f"*{suffix}.*"):
+                                f.unlink()
+                        continue
+
                     print(f"Processed depth and deleted {depth_path}")
                 except Exception as e:
                     print(f"Error processing depth {depth_path}: {e}")
@@ -255,29 +584,59 @@ def main(args):
             # ------------------------------------------------------------------
             # IMAGE / RGB
             # ------------------------------------------------------------------
-            # Check if there is an Image EXR (rendering pipeline sometimes outputs both)
+            # In Blender 5.0 the compositor only saves multilayer EXR, so the
+            # RGB beauty pass arrives as Image####.exr — convert it to PNG.
             image_filename_exr = f"Image{suffix}.exr"
             image_path_exr = frames_folder / "Image" / f"camera_{subcam_id}" / image_filename_exr
-            
-            if image_path_exr.exists():
-                # We only want PNG for RGB image. 
-                # PNG is likely already generated by render pipeline if configured correctly as default.
-                print(f"Deleting extra Image EXR: {image_path_exr}")
-                image_path_exr.unlink()
 
-    # Cleanup tmp folder
-    tmp_dir = args.output_folder / "tmp"
+            if image_path_exr.exists():
+                try:
+                    rgb = load_exr(str(image_path_exr))  # returns BGR
+                    if rgb is None:
+                        raise RuntimeError("load_exr returned None")
+                    # BGR -> RGB and tonemap to 8-bit sRGB
+                    rgb = rgb[..., ::-1]
+                    rgb = np.clip(rgb, 0.0, 1.0)
+                    # Simple linear → sRGB approximation
+                    rgb_srgb = np.where(
+                        rgb <= 0.0031308,
+                        12.92 * rgb,
+                        1.055 * np.power(np.maximum(rgb, 0.0), 1 / 2.4) - 0.055,
+                    )
+                    rgb_uint8 = (np.clip(rgb_srgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+                    imageio.imwrite(image_path_exr.with_suffix(".png"), rgb_uint8)
+                    image_path_exr.unlink()
+                    print(f"Converted Image EXR -> PNG and deleted {image_path_exr.name}")
+                except Exception as e:
+                    print(f"Error converting Image EXR {image_path_exr}: {e}")
+
+    # --- Cleanup ---
+    # The compositor accumulates file output nodes across renders, so earlier
+    # cameras' EXRs get re-written by later renders. Delete all leftover EXRs
+    # and camview files in one pass.
+    import shutil
+    for exr in frames_folder.rglob("*.exr"):
+        exr.unlink()
+    camview_dir = frames_folder / "camview"
+    if camview_dir.exists():
+        shutil.rmtree(camview_dir)
+    tmp_dir = output_folder / "tmp"
     if tmp_dir.exists() and tmp_dir.is_dir():
-        import shutil
-        print(f"Cleaning up tmp directory: {tmp_dir}")
         shutil.rmtree(tmp_dir)
 
-    print("Render complete.")
+    _phase_done("render", t0)
+
+    # List final output files
+    print("\n=== Output files ===")
+    for p in sorted(frames_folder.rglob("*")):
+        if p.is_file():
+            print(f"  {p.relative_to(frames_folder)}")
+
+    logger.info("Done.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_blend', required=True, type=Path, help="Path to input .blend file")
-    parser.add_argument('--output_folder', required=True, type=Path, help="Output folder")
+    parser.add_argument('--city_dir', required=True, type=Path, help="Path to city directory (e.g. models/city1), containing a .blend file and HDRI .exr")
     parser.add_argument('-g', '--configs', nargs='+', default=[], help="Gin config files")
     parser.add_argument('-p', '--overrides', nargs='+', default=[], help="Gin config overrides")
     # Ignored args that manage_jobs might pass
@@ -286,4 +645,5 @@ if __name__ == "__main__":
     parser.add_argument('--task_uniqname', default='')
     
     args = parser.parse_args()
-    main(args)
+    with suppress_blender_output():
+        main(args)

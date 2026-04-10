@@ -36,6 +36,10 @@ def object_to_vertex_attributes(obj, specified=None, skip_internal=True):
             (specified is None) or (specified is not None and attr in specified)
         ) and obj.data.attributes[attr].domain == "POINT":
             type_key = obj.data.attributes[attr].data_type
+            if type_key not in ATTRTYPE_DIMS:
+                # Unknown / unsupported attribute type — silently skip rather
+                # than crashing the whole BVH build over a stray attribute.
+                continue
             tmp = np.zeros(
                 len(obj.data.vertices) * ATTRTYPE_DIMS[type_key], dtype=np.float32
             )
@@ -53,6 +57,8 @@ def object_to_face_attributes(obj, specified=None, skip_internal=True):
             (specified is None) or (specified is not None and attr in specified)
         ) and obj.data.attributes[attr].domain == "FACE":
             type_key = obj.data.attributes[attr].data_type
+            if type_key not in ATTRTYPE_DIMS:
+                continue
             tmp = np.zeros(
                 len(obj.data.polygons) * ATTRTYPE_DIMS[type_key], dtype=np.float32
             )
