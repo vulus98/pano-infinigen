@@ -204,45 +204,149 @@ def _force_lights_off():
                     pass
 
 
-def _setup_hdri_world(input_blend: Path, script_dir: Path):
-    """Set up world environment lighting from an HDRI file alongside the input blend."""
-    # Search for an HDRI in: same dir as blend, then script dir
-    candidates = []
-    blend_dir = input_blend.resolve().parent
-    for d in (blend_dir, script_dir):
-        candidates += list(d.glob("*.hdr")) + list(d.glob("*.exr"))
+def _force_wetness_off():
+    """Force dry city (no rain puddles).
 
-    if not candidates:
-        print("No HDRI (.hdr/.exr) found next to the input blend; skipping environment lighting.")
-        return
+    Wetness in iCity is controlled at many levels: a 'Rain density' int socket
+    on most GeometryNodes groups (Road, Sidewalk, Towers, Twisted Towers,
+    Podium Roof, Face to podium, Parks system.001, ...), a 'Wetness' float on
+    Sidewalk materials / Down Town Buildings, 'dry_humid_wet' on front yard /
+    ground materials, plus 'Wet'/'Wet Density' bools. Because the version
+    mismatch between the 5.1-saved .blend and our bpy causes modifier[gid]
+    assignment to be silently dropped, we patch every matching socket's
+    interface default_value directly.
 
-    hdri_path = candidates[0]
-    print(f"Loading HDRI environment: {hdri_path}")
+    We sweep ALL node groups (not just the ones attached to the iCity
+    top-level objects) because linked asset groups like 'Twisted Towers.*'
+    and 'Podium Roof.*' also have Rain density sockets that need zeroing.
+    """
+    # (socket_name_lower_pattern, "dry" value)
+    # Patterns are matched case-insensitively against the socket name.
+    wet_patterns = [
+        ("rain density", 0),
+        ("wetness", 0.0),
+        ("dry_humid_wet", 0),
+        ("roof material wet density", 0.0),
+        ("roof material wet", False),
+    ]
 
-    # Get or create a world
-    world = bpy.context.scene.world
-    if world is None:
-        world = bpy.data.worlds.new("World")
-        bpy.context.scene.world = world
+    n_patched = 0
+    for ng in bpy.data.node_groups:
+        if not hasattr(ng, "interface"):
+            continue
+        try:
+            items = ng.interface.items_tree
+        except Exception:
+            continue
+        for item in items:
+            name = getattr(item, "name", None)
+            if not name:
+                continue
+            name_l = name.strip().lower()
+            # Match 'Wet'/'Wet ' sockets separately to avoid collisions with
+            # e.g. 'Wetness' or 'dry_humid_wet' (handled in the pattern list).
+            if name_l == "wet":
+                try:
+                    item.default_value = False
+                    n_patched += 1
+                except (AttributeError, TypeError):
+                    pass
+                continue
+            for pattern, dry_value in wet_patterns:
+                if pattern in name_l:
+                    try:
+                        item.default_value = dry_value
+                        n_patched += 1
+                    except (AttributeError, TypeError):
+                        pass
+                    break
+    print(f"Patched {n_patched} wetness-related sockets")
 
-    world.use_nodes = True
-    nt = world.node_tree
-    nt.nodes.clear()
+    # Modifier-level values stored in the saved .blend override interface
+    # defaults at evaluation time. Sweep every GeometryNodes modifier on
+    # every object and force any wetness socket's stored value to the dry
+    # equivalent (same matching rules as above).
+    def _dry_value_for(socket_name_lower, socket):
+        if socket_name_lower == "wet":
+            return False
+        for pattern, dry_value in wet_patterns:
+            if pattern in socket_name_lower:
+                return dry_value
+        return None
 
-    out_node = nt.nodes.new("ShaderNodeOutputWorld")
-    bg_node = nt.nodes.new("ShaderNodeBackground")
-    env_node = nt.nodes.new("ShaderNodeTexEnvironment")
+    n_mod_patched = 0
+    for obj in bpy.data.objects:
+        if not hasattr(obj, "modifiers"):
+            continue
+        for mod in obj.modifiers:
+            if mod.type != 'NODES' or mod.node_group is None:
+                continue
+            ng = mod.node_group
+            try:
+                items = ng.interface.items_tree
+            except Exception:
+                continue
+            for item in items:
+                name = getattr(item, "name", None)
+                if not name:
+                    continue
+                name_l = name.strip().lower()
+                dry = _dry_value_for(name_l, item)
+                if dry is None:
+                    continue
+                try:
+                    mod[item.identifier] = dry
+                    n_mod_patched += 1
+                except (KeyError, AttributeError, TypeError):
+                    pass
+    print(f"Overrode {n_mod_patched} modifier-level wetness values")
 
-    env_node.image = bpy.data.images.load(str(hdri_path), check_existing=True)
-    bg_node.inputs["Strength"].default_value = 1.0
+    # Globally remap every '* wet*' material to its dry equivalent. Wet
+    # materials are referenced via GN Index Switch nodes (inside the 'wet'
+    # sub-group of Road v3 and similar), NOT via object material slots.
+    # user_remap walks all references in bpy.data — slots, shader nodes,
+    # GN inputs — and rewrites them in one call.
+    n_remapped = 0
+    n_deleted = 0
+    wet_mats = [m for m in bpy.data.materials if " wet" in m.name.lower() or "_wet" in m.name.lower()]
+    for wet_mat in wet_mats:
+        # "ICity_Road_Ashphalt_high wet.002" -> "ICity_Road_Ashphalt_high.002"
+        # "Crack decal_wet.000"               -> "Crack decal.000"
+        dry_name = wet_mat.name
+        for token in (" wet", " Wet", "_wet", "_Wet"):
+            dry_name = dry_name.replace(token, "")
+        dry_mat = bpy.data.materials.get(dry_name)
+        if dry_mat is not None and dry_mat is not wet_mat:
+            wet_mat.user_remap(dry_mat)
+            n_remapped += 1
+        else:
+            # No dry equivalent: make the wet material render as
+            # transparent/invisible so any leftover reference contributes nothing.
+            if wet_mat.use_nodes and wet_mat.node_tree:
+                for node in list(wet_mat.node_tree.nodes):
+                    if node.type == 'BSDF_PRINCIPLED':
+                        try:
+                            node.inputs['Alpha'].default_value = 0.0
+                        except (KeyError, AttributeError):
+                            pass
+                        try:
+                            node.inputs['Roughness'].default_value = 1.0
+                        except (KeyError, AttributeError):
+                            pass
+                        try:
+                            node.inputs['Metallic'].default_value = 0.0
+                        except (KeyError, AttributeError):
+                            pass
+                n_deleted += 1
+    print(f"Remapped {n_remapped} wet materials to dry; neutralized {n_deleted} without dry equivalent")
 
-    nt.links.new(env_node.outputs["Color"], bg_node.inputs["Color"])
-    nt.links.new(bg_node.outputs["Background"], out_node.inputs["Surface"])
-
-    # Layout (cosmetic, harmless headless)
-    env_node.location = (-400, 0)
-    bg_node.location = (-150, 0)
-    out_node.location = (100, 0)
+    # Flip the iCity property toggle too
+    main_props = getattr(bpy.context.scene, "parametra_icity_main", None)
+    if main_props is not None and hasattr(main_props, "road_moisture"):
+        try:
+            main_props.road_moisture = "0%"
+        except Exception:
+            pass
 
 
 def main(args):
@@ -283,6 +387,8 @@ def main(args):
 
     # Force iCity night-mode lights off (bpy 4.5 drops the saved False values)
     _force_lights_off()
+    # Force dry city (rain puddles get re-enabled on version-mismatched load)
+    _force_wetness_off()
 
     # 2. Apply configs
     # This sets up rendering settings, camera parameters etc on the loaded scene
