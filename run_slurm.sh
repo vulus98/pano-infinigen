@@ -4,15 +4,16 @@
 #SBATCH --array=1-10000
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --mem-per-cpu=4G
-#SBATCH --time=16:00:00
-#SBATCH --tmp=208000
+#SBATCH --mem-per-cpu=8G
+#SBATCH --time=50:00:00
+#SBATCH --tmp=408000
 #SBATCH -o logs/%A_%a.out
-#SBATCH --gpus=rtx_4090:1
+#SBATCH --gpus=pro_6000:1
 
+#alternative gpu: pro_6000
 # Default to urban if SCENE_TYPE is not provided
 SCENE_TYPE=${SCENE_TYPE:-urban}
-
+    
 source  ~/miniconda3/etc/profile.d/conda.sh
 conda activate infinigen_city
 
@@ -53,7 +54,7 @@ elif [ "$SCENE_TYPE" == "urban" ]; then
     fi
     python process_custom_blend.py --city_dir "$city_dir" \
         -g local_256GB.gin monocular.gin blender_gt.gin \
-        -p "camera.spawn_camera_rigs.n_camera_rigs=10" \
+        -p "camera.spawn_camera_rigs.n_camera_rigs=500" \
            "camera.compute_base_views.max_tries=100000" \
            "camera.spawn_camera_rigs.camera_rig_config=[{'loc':(0,0,0),'rot_euler':(0,0,0)}]" \
         --seed 0

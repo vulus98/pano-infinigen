@@ -644,7 +644,7 @@ def main(args):
                     depth_raw = load_depth(str(depth_path))
 
                     # Clamp max depth to 125m (sky and far structures) for saving
-                    MAX_DEPTH = 125.0
+                    MAX_DEPTH = 500.0
                     depth_clamped = np.clip(depth_raw, None, MAX_DEPTH)
 
                     # Save clamped .npy (float32)
