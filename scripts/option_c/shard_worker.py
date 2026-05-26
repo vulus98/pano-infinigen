@@ -21,7 +21,7 @@ from .encoder import (
     decode_npy_or_npz,
     encode_depth_png,
     encode_depth_viz_png,
-    encode_normals_png,
+    encode_normals_viz_png,
     transcode_image_to_jpg,
 )
 
@@ -65,11 +65,19 @@ def _wrap(b: bytes) -> dict:
 
 
 def _encode_row(args):
-    """Multiprocessing worker: encode one row, return four byte-blobs.
+    """Multiprocessing worker: encode one row, return five byte-blobs.
 
-    `image` is transcoded from the source PNG to JPG q=95 to keep per-row
-    payload small enough for HF Data Studio's worker timeout (the source
-    PNGs are ~7 MB each, JPG q=95 brings them to ~1.5 MB).
+    Layout:
+      image      -> JPEG q=95 (transcoded from source PNG, ~1.5 MB)
+      depth      -> 16-bit PNG (per-config scale, ~1 MB)
+      depth_viz  -> 8-bit Spectral RGB PNG preview (~0.3 MB)
+      normals    -> raw `.npy` bytes (binary, float16, ~50 MB)
+      normals_viz-> 8-bit RGB PNG preview downsampled to 1024 px tall (~0.3 MB)
+
+    `normals` stays as raw float16 NPY to preserve full precision; the
+    viewer uses `normals_viz` instead. `image` is transcoded to JPG so the
+    per-row Image-cell payload stays small enough for HF Data Studio's
+    worker timeout at length=100.
     """
     img_bytes, depth_bytes, normals_bytes, depth_max_m = args
     depth_arr = decode_npy_or_npz(depth_bytes).astype("float32", copy=False)
@@ -78,18 +86,19 @@ def _encode_row(args):
         transcode_image_to_jpg(img_bytes),
         encode_depth_png(depth_arr, depth_max_m),
         encode_depth_viz_png(depth_arr),
-        encode_normals_png(normals_arr),
+        normals_bytes,
+        encode_normals_viz_png(normals_arr),
     )
 
 
 def reencode_shard(backup_file: Path, new_file: Path, depth_max_m: float, cpus: int) -> None:
     """Read backup parquet, encode all rows, write Option C parquet."""
     if new_file.exists() and new_file.stat().st_size > 0:
-        # Re-verify schema; if it already has the four image cols, skip.
+        # Re-verify schema; if all five expected columns are present, skip.
         try:
             schema = pq.read_schema(new_file)
             cols = set(schema.names)
-            if {"image", "depth", "depth_viz", "normals"} <= cols:
+            if {"image", "depth", "depth_viz", "normals", "normals_viz"} <= cols:
                 logger.info("[encode] skip %s (already encoded)", new_file.name)
                 return
         except Exception:
@@ -108,32 +117,45 @@ def reencode_shard(backup_file: Path, new_file: Path, depth_max_m: float, cpus: 
         ib = img["bytes"] if isinstance(img, dict) else img
         inputs.append((ib, depth_cells[i], normals_cells[i], depth_max_m))
 
-    images, depths, depth_vizs, normals = [None] * n, [None] * n, [None] * n, [None] * n
+    images = [None] * n
+    depths = [None] * n
+    depth_vizs = [None] * n
+    normals_bin = [None] * n
+    normals_vizs = [None] * n
     if cpus <= 1:
         for i, args in enumerate(inputs):
-            ib, dp, dv, nm = _encode_row(args)
+            ib, dp, dv, nm_raw, nm_viz = _encode_row(args)
             images[i] = _wrap(ib)
             depths[i] = _wrap(dp)
             depth_vizs[i] = _wrap(dv)
-            normals[i] = _wrap(nm)
+            normals_bin[i] = nm_raw
+            normals_vizs[i] = _wrap(nm_viz)
     else:
         with ProcessPoolExecutor(max_workers=cpus) as pool:
             futs = {pool.submit(_encode_row, args): idx for idx, args in enumerate(inputs)}
             for fut in as_completed(futs):
                 idx = futs[fut]
-                ib, dp, dv, nm = fut.result()
+                ib, dp, dv, nm_raw, nm_viz = fut.result()
                 images[idx] = _wrap(ib)
                 depths[idx] = _wrap(dp)
                 depth_vizs[idx] = _wrap(dv)
-                normals[idx] = _wrap(nm)
+                normals_bin[idx] = nm_raw
+                normals_vizs[idx] = _wrap(nm_viz)
 
     out_tbl = pa.table({
         "image": pa.array(images, type=_IMG_STRUCT),
         "depth": pa.array(depths, type=_IMG_STRUCT),
         "depth_viz": pa.array(depth_vizs, type=_IMG_STRUCT),
-        "normals": pa.array(normals, type=_IMG_STRUCT),
+        "normals": pa.array(normals_bin, type=pa.binary()),
+        "normals_viz": pa.array(normals_vizs, type=_IMG_STRUCT),
     })
-    feature_meta = {c: {"_type": "Image"} for c in ("image", "depth", "depth_viz", "normals")}
+    feature_meta = {
+        "image": {"_type": "Image"},
+        "depth": {"_type": "Image"},
+        "depth_viz": {"_type": "Image"},
+        "normals": {"dtype": "binary", "_type": "Value"},
+        "normals_viz": {"_type": "Image"},
+    }
     out_tbl = out_tbl.replace_schema_metadata({
         b"huggingface": json.dumps({"info": {"features": feature_meta}}).encode()
     })

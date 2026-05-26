@@ -81,6 +81,28 @@ def encode_normals_png(normals_f32: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def encode_normals_viz_png(normals_f32: np.ndarray, target_height: int = 1024) -> bytes:
+    """Small, viewer-only PNG preview of the normal map (downsampled to
+    `target_height` px tall, aspect-ratio preserved). The full-precision
+    normals stay in the separate binary `normals` column.
+
+    The aggressive downsample keeps the cell to ~200-400 KB even on the
+    high-frequency urban shards, which is what fits HF Data Studio's
+    per-page worker budget at default length=100.
+    """
+    if normals_f32.ndim != 3 or normals_f32.shape[-1] != 3:
+        raise ValueError(f"expected normals shape (H, W, 3), got {normals_f32.shape}")
+    arr = np.nan_to_num(normals_f32, nan=0.0, posinf=1.0, neginf=-1.0)
+    px = np.clip((arr + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
+    img = PILImage.fromarray(px, mode="RGB")
+    if img.height > target_height:
+        ratio = target_height / img.height
+        img = img.resize((int(img.width * ratio), target_height), PILImage.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
 def encode_depth_viz_png(depth_f32: np.ndarray) -> bytes:
     """Spectral-colored log-depth preview (8-bit RGB PNG). Preview only."""
     valid = depth_f32 > 0
