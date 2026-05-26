@@ -46,9 +46,8 @@ fi
 echo "$(date) creating/ensuring $VALIDATION_REPO (public)"
 python -c "
 import os
-from huggingface_hub import HfApi, login
-login(os.environ['HF_TOKEN'])
-HfApi().create_repo(
+from huggingface_hub import HfApi
+HfApi(token=os.environ['HF_TOKEN']).create_repo(
     repo_id='${VALIDATION_REPO}',
     repo_type='dataset',
     private=False,

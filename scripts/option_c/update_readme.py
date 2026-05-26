@@ -18,7 +18,7 @@ import re
 import sys
 from pathlib import Path
 
-from huggingface_hub import HfApi, login
+from huggingface_hub import HfApi
 
 from . import DEPTH_MAX_M, SOURCE_REPO
 
@@ -113,10 +113,9 @@ def main():
         print(new_text.split("---", 2)[1])
         return
 
-    token = os.environ.get("HF_TOKEN")
-    if token:
-        login(token=token)
-    api = HfApi()
+    # HfApi reads HF_TOKEN from env; avoid huggingface_hub.login() because
+    # it writes to a shared cache file that races with concurrent jobs.
+    api = HfApi(token=os.environ.get("HF_TOKEN"))
     api.upload_file(
         path_or_fileobj=new_text.encode(),
         path_in_repo="README.md",

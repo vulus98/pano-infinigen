@@ -39,7 +39,7 @@ import os
 import sys
 from pathlib import Path
 
-from huggingface_hub import HfApi, login
+from huggingface_hub import HfApi
 
 from . import SOURCE_REPO
 from .manifest import filter_manifest, slice_for_task
@@ -85,10 +85,12 @@ def main():
     if ("reencode" in phases or "upload" in phases) and not args.new_dir:
         sys.exit("--new-dir is required for reencode/upload phases")
 
+    # Don't call huggingface_hub.login() here: it writes to
+    # ~/.cache/huggingface/stored_tokens, which races between parallel
+    # Slurm array tasks. HfApi() + hf_hub_download() both read HF_TOKEN
+    # from the environment, so explicit login is unnecessary.
     token = os.environ.get("HF_TOKEN")
-    if token:
-        login(token=token)
-    api = HfApi()
+    api = HfApi(token=token)
 
     manifest = json.loads(Path(args.manifest).read_text())
     manifest = filter_manifest(manifest, args.config, args.split)

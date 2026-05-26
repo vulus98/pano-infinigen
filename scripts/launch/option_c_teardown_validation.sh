@@ -30,9 +30,8 @@ fi
 echo "$(date) deleting $VALIDATION_REPO"
 python -c "
 import os
-from huggingface_hub import delete_repo, login
-login(os.environ['HF_TOKEN'])
-delete_repo('${VALIDATION_REPO}', repo_type='dataset')
+from huggingface_hub import delete_repo
+delete_repo('${VALIDATION_REPO}', repo_type='dataset', token=os.environ['HF_TOKEN'])
 print('deleted ${VALIDATION_REPO}')
 "
 echo "$(date) teardown complete"
