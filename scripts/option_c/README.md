@@ -23,67 +23,55 @@ This pipeline is the exact recipe validated on
 
 ## Files
 
-| Path                                        | Role                                            |
-| :---                                        | :---                                            |
-| `scripts/option_c/__init__.py`              | Per-config constants (`DEPTH_MAX_M`)            |
-| `scripts/option_c/encoder.py`               | Pure encoders: depth / normals / depth_viz PNG. |
-| `scripts/option_c/manifest.py`              | Build the shard manifest by querying HF.        |
-| `scripts/option_c/shard_worker.py`          | `backup → reencode → upload` for one shard.     |
-| `scripts/option_c/process_batch.py`         | Slurm-array entry: handles a slice of shards.   |
-| `scripts/option_c/update_readme.py`         | Final dataset-card YAML/markdown rewrite.       |
-| `scripts/option_c/test_repo_stub_README.md` | README stub for the validation test repo.       |
-| `scripts/launch/option_c_backup.sh`         | Slurm array, **Phase 1**: backup every shard.   |
-| `scripts/launch/option_c_reencode.sh`       | Slurm array, **Phase 2**: re-encode + upload.   |
-| `scripts/launch/option_c_test_pipeline.sh`  | End-to-end small-scale validation (urban/val).  |
+| Path                                            | Role                                            |
+| :---                                            | :---                                            |
+| `scripts/option_c/__init__.py`                  | Per-config constants (`DEPTH_MAX_M`)            |
+| `scripts/option_c/encoder.py`                   | Pure encoders: depth / normals / depth_viz PNG. |
+| `scripts/option_c/manifest.py`                  | Build the shard manifest by querying HF.        |
+| `scripts/option_c/shard_worker.py`              | `backup → reencode → upload` for one shard.     |
+| `scripts/option_c/process_batch.py`             | Slurm-array entry: handles a slice of shards.   |
+| `scripts/option_c/update_readme.py`             | Final dataset-card YAML/markdown rewrite.       |
+| `scripts/option_c/test_repo_stub_README.md`     | README stub for the validation test repo.       |
+| `scripts/launch/option_c_setup_validation.sh`   | **0. Setup**: generate manifest + create the validation repo + push its stub README. |
+| `scripts/launch/option_c_test_pipeline.sh`      | **A. Test**: end-to-end validation on urban/val. |
+| `scripts/launch/option_c_backup.sh`             | **B. Phase 1**: mirror every shard to scratch. |
+| `scripts/launch/option_c_reencode.sh`           | **C. Phase 2**: re-encode + upload (overwrites). |
+| `scripts/launch/option_c_finalize_readme.sh`    | **D. Phase 3**: rewrite the dataset card.       |
+| `scripts/launch/option_c_teardown_validation.sh`| **E. Cleanup** (optional): delete the validation repo. |
 
 ## Workflow
 
-### 0. Prerequisites (one time)
+Everything is launched through `sbatch`. **No interactive Python required.**
+Set `HF_TOKEN` in your shell once, then submit the scripts in order.
 
 ```bash
-# On the cluster login node:
-export HF_TOKEN='hf_...'                 # write token for prs-eth/PanoInfinigen
-conda activate infinigen                  # the env already has matplotlib, scipy, pyarrow, huggingface_hub
-mkdir -p logs                             # Slurm log dir, relative to scripts/launch
+export HF_TOKEN='hf_...'   # write scope on prs-eth/PanoInfinigen
+                           # and on vulus98/panoinfinigen-option-c-validation
+cd /path/to/pano-infinigen
 ```
 
-### 1. Generate manifest (fast, ~30 s)
+### 0. Setup the validation repo + manifest (~1 min)
 
 ```bash
-python -m scripts.option_c.manifest --out /cluster/scratch/$USER/panoinfinigen_manifest.json
+sbatch scripts/launch/option_c_setup_validation.sh
 ```
 
-Sanity-checks against the live HF parquet branch and prints a per-(config, split) shard count summary. Both phase scripts will also auto-generate this if absent.
+Generates the shard manifest, creates `vulus98/panoinfinigen-option-c-validation` on the Hub as a public dataset (no-op if it already exists), and uploads the stub README.
 
-### 2. Small-scale validation (~30 min wall)
-
-Mirrors and re-encodes only the 18 shards of `urban/val` (~23 GB), uploading to a separate **test repo** so production is untouched.
+### A. Small-scale validation (~30 min wall)
 
 ```bash
-# Create the test repo + push the stub README:
-python - <<'PY'
-import os
-from huggingface_hub import HfApi, login
-login(os.environ["HF_TOKEN"])
-HfApi().create_repo(
-    "vulus98/panoinfinigen-option-c-validation",
-    repo_type="dataset", private=False, exist_ok=True,
-)
-PY
-python -m scripts.option_c.update_readme \
-    --repo vulus98/panoinfinigen-option-c-validation \
-    --input scripts/option_c/test_repo_stub_README.md
-
-# Launch the test (4 parallel array tasks, ~5 shards each):
 sbatch scripts/launch/option_c_test_pipeline.sh
 ```
+
+Backs up + re-encodes + uploads only the 18 shards of `urban/val` (~23 GB), targeting the validation repo. Production is untouched.
 
 When the job finishes, refresh https://huggingface.co/datasets/vulus98/panoinfinigen-option-c-validation/viewer and confirm:
 1. All four columns render — `image`, `depth`, `depth_viz`, `normals`.
 2. `depth_viz` colors span the full Spectral gradient (per-image stretch).
-3. Decoding `depth` in a notebook returns metric values consistent with the source.
+3. Decoded `depth` in a notebook returns metric values consistent with the source.
 
-### 3. Phase 1 — Backup every shard (~few hours)
+### B. Phase 1 — Backup every shard (~few hours)
 
 ```bash
 sbatch --export=ALL,NUM_TASKS=32 scripts/launch/option_c_backup.sh
@@ -91,7 +79,7 @@ sbatch --export=ALL,NUM_TASKS=32 scripts/launch/option_c_backup.sh
 
 Mirrors all 1,515 parquet shards to `/cluster/scratch/$USER/panoinfinigen_backup/`. Idempotent — restartable jobs skip files that already exist with matching sizes. **Don't proceed until this is fully green.**
 
-### 4. Phase 2 — Re-encode + upload (~10–24 h wall with NUM_TASKS=64)
+### C. Phase 2 — Re-encode + upload (~10–24 h wall with NUM_TASKS=64)
 
 ```bash
 sbatch --export=ALL,NUM_TASKS=64 scripts/launch/option_c_reencode.sh
@@ -103,23 +91,32 @@ Tune `NUM_TASKS` higher (e.g. 128) for faster wall time at the cost of more conc
 
 Multiple back-to-back submissions are safe — every step is idempotent.
 
-### 5. Phase 3 — Rewrite the dataset card
+### D. Phase 3 — Rewrite the dataset card (~1 min)
 
 ```bash
-python -m scripts.option_c.update_readme --repo prs-eth/PanoInfinigen
+sbatch scripts/launch/option_c_finalize_readme.sh
 ```
 
 Drops the stale `dataset_info` YAML block (forces HF to re-derive features from the new parquets — this is what fixed the cast errors on ZuriPano), and rewrites the *Data Structure* and *How to Use* sections to match the new schema.
 
-### 6. Tear down the validation repo
+### E. Tear down the validation repo (~1 min, optional)
 
 ```bash
-python - <<'PY'
-import os
-from huggingface_hub import delete_repo, login
-login(os.environ["HF_TOKEN"])
-delete_repo("vulus98/panoinfinigen-option-c-validation", repo_type="dataset")
-PY
+sbatch scripts/launch/option_c_teardown_validation.sh
+```
+
+### Chained one-shot submission (optional)
+
+If you'd rather submit everything in one go and let Slurm dependencies serialize the phases:
+
+```bash
+J0=$(sbatch --parsable scripts/launch/option_c_setup_validation.sh)
+JT=$(sbatch --parsable --dependency=afterok:$J0   scripts/launch/option_c_test_pipeline.sh)
+# (pause to inspect the viewer here — break the chain by re-running from JB if happy)
+JB=$(sbatch --parsable --dependency=afterok:$JT   scripts/launch/option_c_backup.sh)
+JR=$(sbatch --parsable --dependency=afterok:$JB   scripts/launch/option_c_reencode.sh)
+JF=$(sbatch --parsable --dependency=afterok:$JR   scripts/launch/option_c_finalize_readme.sh)
+echo "setup=$J0 test=$JT backup=$JB reencode=$JR finalize=$JF"
 ```
 
 ## Operational notes
