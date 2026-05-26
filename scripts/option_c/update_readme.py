@@ -32,6 +32,13 @@ Three configurations: `indoor`, `nature`, `urban`. Each has `train`, `val`,
 | `depth`     | `Image` | 16-bit single-channel PNG. Decode to **metres** as `np.asarray(img, np.float32) * MAX_M / 65535.0`, where `MAX_M` is **75** for `indoor`, **75** for `nature`, **500** for `urban` (matching the renderer's hard clip). Invalid pixels (none in synthetic data) would be `0.0`. |
 | `depth_viz` | `Image` | 8-bit RGB Spectral-colormapped log-depth preview. **Preview only — do NOT use for metrics or training; decode `depth` instead.** |
 | `normals`   | `Image` | 8-bit RGB PNG of `(n + 1) / 2 * 255`. Decode to **unit normals** in `[-1, 1]` as `np.asarray(img, np.float32) / 127.5 - 1.0`. |
+
+> **Note on Data Studio (urban config only):** the `urban` shards have inherently
+> dense surface-normal maps (architectural detail) that PNG can't compress past
+> ~8 MB / cell. The HF Data Studio default page size of 100 rows triggers a
+> server-side timeout. **Drop the "Rows per page" dropdown at the bottom of Data
+> Studio to 50** to browse `urban`; the inline preview at the top of this page
+> and `load_dataset(...)` from Python are unaffected.
 """
 
 CARD_NEW_HOWTO = """## How to Use
