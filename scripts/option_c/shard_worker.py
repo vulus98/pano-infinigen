@@ -133,7 +133,9 @@ def reencode_shard(backup_file: Path, new_file: Path, depth_max_m: float, cpus: 
     })
 
     new_file.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(out_tbl, str(new_file), compression="snappy")
+    # Cap row groups at 4 rows so each stays well below the HF data-studio
+    # 300 MB row-group scan limit (~20 MB/row * 4 = ~80 MB, plenty of headroom).
+    pq.write_table(out_tbl, str(new_file), compression="snappy", row_group_size=4)
     elapsed = time.time() - t
     logger.info(
         "[encode] %s  %d rows  %.1f MB  %.1fs",
