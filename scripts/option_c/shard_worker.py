@@ -22,6 +22,7 @@ from .encoder import (
     encode_depth_png,
     encode_depth_viz_png,
     encode_normals_png,
+    transcode_image_to_jpg,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,12 +65,17 @@ def _wrap(b: bytes) -> dict:
 
 
 def _encode_row(args):
-    """Multiprocessing worker: encode one row, return four byte-blobs."""
+    """Multiprocessing worker: encode one row, return four byte-blobs.
+
+    `image` is transcoded from the source PNG to JPG q=95 to keep per-row
+    payload small enough for HF Data Studio's worker timeout (the source
+    PNGs are ~7 MB each, JPG q=95 brings them to ~1.5 MB).
+    """
     img_bytes, depth_bytes, normals_bytes, depth_max_m = args
     depth_arr = decode_npy_or_npz(depth_bytes).astype("float32", copy=False)
     normals_arr = decode_npy_or_npz(normals_bytes).astype("float32", copy=False)
     return (
-        img_bytes,
+        transcode_image_to_jpg(img_bytes),
         encode_depth_png(depth_arr, depth_max_m),
         encode_depth_viz_png(depth_arr),
         encode_normals_png(normals_arr),

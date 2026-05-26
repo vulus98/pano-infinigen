@@ -28,7 +28,7 @@ Three configurations: `indoor`, `nature`, `urban`. Each has `train`, `val`,
 
 | Feature     | Type    | Description |
 | :---        | :---    | :---        |
-| `image`     | `Image` | 8-bit RGB equirectangular panorama (PNG-encoded by the renderer). |
+| `image`     | `Image` | 8-bit RGB equirectangular panorama, JPEG (q=95) — transcoded from the source PNG to keep per-row payload small enough for the HF data viewer. Visually indistinguishable from the source. |
 | `depth`     | `Image` | 16-bit single-channel PNG. Decode to **metres** as `np.asarray(img, np.float32) * MAX_M / 65535.0`, where `MAX_M` is **75** for `indoor`, **75** for `nature`, **500** for `urban` (matching the renderer's hard clip). Invalid pixels (none in synthetic data) would be `0.0`. |
 | `depth_viz` | `Image` | 8-bit RGB Spectral-colormapped log-depth preview. **Preview only — do NOT use for metrics or training; decode `depth` instead.** |
 | `normals`   | `Image` | 8-bit RGB PNG of `(n + 1) / 2 * 255`. Decode to **unit normals** in `[-1, 1]` as `np.asarray(img, np.float32) / 127.5 - 1.0`. |
@@ -65,7 +65,7 @@ def rewrite_readme(text: str) -> str:
     # 2. Update the Modality bullet in Dataset Summary.
     text = re.sub(
         r"- \*\*Modality:\*\*[^\n]*\n",
-        "- **Modality:** RGB (PNG), Depth (16-bit PNG, per-config scale factor), "
+        "- **Modality:** RGB (JPEG q=95), Depth (16-bit PNG, per-config scale factor), "
         "Surface Normals (8-bit RGB PNG), Depth Viz (8-bit Spectral RGB PNG, preview only).\n",
         text,
         count=1,

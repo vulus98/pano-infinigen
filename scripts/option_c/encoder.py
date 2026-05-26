@@ -45,6 +45,20 @@ def encode_depth_png(depth_f32: np.ndarray, max_m: float) -> bytes:
     return buf.getvalue()
 
 
+def transcode_image_to_jpg(image_bytes: bytes, quality: int = 95) -> bytes:
+    """Re-encode the source `image` cell as JPEG (default quality 95).
+
+    Synthetic Infinigen renders are stored as ~7 MB PNG by the upstream
+    pipeline. Transcoding to JPG q=95 shrinks them ~4-5x with no visible
+    loss, which is what makes the HF Data Studio rows endpoint stay under
+    the worker's 30 s timeout at length=100.
+    """
+    img = PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
 def encode_normals_png(normals_f32: np.ndarray) -> bytes:
     """Encode unit-normal field as 8-bit RGB PNG.
 
