@@ -76,3 +76,10 @@ models
 
 iCity/
 iCity - Default Theme/
+
+# Dataset payloads (HF dataset snapshot — kept out of git)
+data/
+
+# Local working artefacts of the Option C re-encode pipeline
+hf_preview_cache/
+scripts/launch/logs/
