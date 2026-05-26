@@ -24,6 +24,7 @@ module load eth_proxy 2>/dev/null || true
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT"
 
 : "${HF_TOKEN:?HF_TOKEN must be set (write scope on the target test repo)}"
 : "${VALIDATION_REPO:=vulus98/panoinfinigen-option-c-validation}"
