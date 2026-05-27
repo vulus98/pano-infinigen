@@ -59,16 +59,20 @@ def transcode_image_to_jpg(image_bytes: bytes, quality: int = 95) -> bytes:
     return buf.getvalue()
 
 
-def encode_normals_png(normals_f32: np.ndarray) -> bytes:
-    """Encode unit-normal field as 8-bit RGB PNG.
+def encode_normals_jpg(normals_f32: np.ndarray, quality: int = 95) -> bytes:
+    """Encode unit-normal field as 8-bit RGB JPEG.
 
-    Maps ``[-1, 1]`` -> ``[0, 255]`` per channel. The resulting image is
-    directly viewable as a standard "normal map".
+    Maps ``[-1, 1]`` -> ``[0, 255]`` per channel and writes JPG (default
+    q=95). The resulting image is directly viewable as a standard
+    "normal map" in the HF data viewer.
 
-    NaN pixels (occur in the source data on sky / invalid regions) are
-    replaced with 0 before the cast, otherwise `np.float32 -> uint8`
-    produces high-entropy garbage that destroys PNG compression (a single
-    8 MB shard becomes the dominant per-row cost otherwise).
+    NaN pixels (sky / invalid regions in the source) are replaced with 0
+    before the cast.
+
+    Why JPG, not PNG: per-cell sizes on urban shards drop from ~8 MB PNG
+    to ~2 MB JPG q=95, with ~1-degree directional error after decode
+    (smaller than the float16 -> uint8 cast we accepted in the first place).
+    See ``RESEARCH_REPORT.md`` next to this file for the full rationale.
 
     Decode formula: ``np.asarray(img, np.float32) / 127.5 - 1.0``.
     """
@@ -77,29 +81,7 @@ def encode_normals_png(normals_f32: np.ndarray) -> bytes:
     arr = np.nan_to_num(normals_f32, nan=0.0, posinf=1.0, neginf=-1.0)
     px = np.clip((arr + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
     buf = io.BytesIO()
-    PILImage.fromarray(px, mode="RGB").save(buf, format="PNG", compress_level=6)
-    return buf.getvalue()
-
-
-def encode_normals_viz_png(normals_f32: np.ndarray, target_height: int = 1024) -> bytes:
-    """Small, viewer-only PNG preview of the normal map (downsampled to
-    `target_height` px tall, aspect-ratio preserved). The full-precision
-    normals stay in the separate binary `normals` column.
-
-    The aggressive downsample keeps the cell to ~200-400 KB even on the
-    high-frequency urban shards, which is what fits HF Data Studio's
-    per-page worker budget at default length=100.
-    """
-    if normals_f32.ndim != 3 or normals_f32.shape[-1] != 3:
-        raise ValueError(f"expected normals shape (H, W, 3), got {normals_f32.shape}")
-    arr = np.nan_to_num(normals_f32, nan=0.0, posinf=1.0, neginf=-1.0)
-    px = np.clip((arr + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
-    img = PILImage.fromarray(px, mode="RGB")
-    if img.height > target_height:
-        ratio = target_height / img.height
-        img = img.resize((int(img.width * ratio), target_height), PILImage.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", compress_level=6)
+    PILImage.fromarray(px, mode="RGB").save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue()
 
 

@@ -26,19 +26,17 @@ CARD_NEW_TABLE = """## Data Structure
 Three configurations: `indoor`, `nature`, `urban`. Each has `train`, `val`,
 `test` splits. Every row carries:
 
-| Feature       | Type     | Description |
-| :---          | :---     | :---        |
-| `image`       | `Image`  | 8-bit RGB equirectangular panorama, JPEG (q=95) — transcoded from the source PNG to keep per-row payload small enough for the HF data viewer. Visually indistinguishable from the source. |
-| `depth`       | `Image`  | 16-bit single-channel PNG. Decode to **metres** as `np.asarray(img, np.float32) * MAX_M / 65535.0`, where `MAX_M` is **75** for `indoor`, **75** for `nature`, **500** for `urban` (matching the renderer's hard clip). Invalid pixels would be `0.0`. |
-| `depth_viz`   | `Image`  | 8-bit RGB Spectral-colormapped log-depth preview. **Preview only — do NOT use for metrics or training; decode `depth` instead.** |
-| `normals`     | `binary` | Raw `.npy` bytes; `np.load(io.BytesIO(sample["normals"]))` returns the original `(H, W, 3)` `float16` array of unit normals in `[-1, 1]`. Full precision preserved. |
-| `normals_viz` | `Image`  | 8-bit RGB PNG of `(n + 1) / 2 * 255`, downsampled to 1024 px tall — what the HF data viewer renders for the normal map. **Preview only — decode `normals` for metric/training use.** |
+| Feature     | Type    | Description |
+| :---        | :---    | :---        |
+| `image`     | `Image` | 8-bit RGB equirectangular panorama, JPEG (q=95) — transcoded from the source PNG. Visually indistinguishable from the source. |
+| `depth`     | `Image` | 16-bit single-channel PNG. Decode to **metres** as `np.asarray(img, np.float32) * MAX_M / 65535.0`, where `MAX_M` is **75** for `indoor`, **75** for `nature`, **500** for `urban` (matching the renderer's hard clip). Invalid pixels would be `0.0`. |
+| `depth_viz` | `Image` | 8-bit RGB Spectral-colormapped log-depth preview. **Preview only — do NOT use for metrics or training; decode `depth` instead.** |
+| `normals`   | `Image` | 8-bit RGB JPEG (q=95) of `(n + 1) / 2 * 255`. Decode to **unit normals** in `[-1, 1]` as `np.asarray(img, np.float32) / 127.5 - 1.0`. JPG quantization introduces ~1° directional error after decode — smaller than the original float16 → uint8 cast already costs and below typical normal-estimation tolerance. |
 """
 
 CARD_NEW_HOWTO = """## How to Use
 
 ```python
-import io
 import numpy as np
 from datasets import load_dataset
 
@@ -48,9 +46,9 @@ config = "indoor"  # or "nature" / "urban"
 ds = load_dataset("prs-eth/PanoInfinigen", name=config, split="train")
 sample = ds[0]
 
-rgb     = sample["image"]                                                                # PIL.Image, (W=4096, H=2048)
-depth   = np.asarray(sample["depth"], dtype=np.float32) * (DEPTH_MAX_M[config] / 65535.0)  # (H, W) float32, metres
-normals = np.load(io.BytesIO(sample["normals"]))                                          # (H, W, 3) float16, unit vectors in [-1, 1]
+rgb     = sample["image"]                                                                  # PIL.Image, (W=4096, H=2048)
+depth   = np.asarray(sample["depth"],   dtype=np.float32) * (DEPTH_MAX_M[config] / 65535.0)  # (H, W) float32, metres
+normals = np.asarray(sample["normals"], dtype=np.float32) / 127.5 - 1.0                    # (H, W, 3) float32, unit vectors in [-1, 1]
 ```
 """
 
@@ -68,7 +66,7 @@ def rewrite_readme(text: str) -> str:
     text = re.sub(
         r"- \*\*Modality:\*\*[^\n]*\n",
         "- **Modality:** RGB (JPEG q=95), Depth (16-bit PNG, per-config scale factor), "
-        "Surface Normals (raw `.npy` float16 bytes), Depth Viz / Normals Viz (8-bit RGB PNG previews).\n",
+        "Surface Normals (8-bit RGB JPEG q=95), Depth Viz (8-bit Spectral RGB PNG, preview only).\n",
         text,
         count=1,
     )

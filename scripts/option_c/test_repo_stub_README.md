@@ -18,10 +18,10 @@ be deleted.
 
 Per-row columns (same as the production target):
 
-- `image` : 8-bit RGB PNG (kept as-is from source).
+- `image` : 8-bit RGB JPEG (q=95, transcoded from source PNG).
 - `depth` : 16-bit single-channel PNG. Decode to **metres** as
   `np.asarray(img, np.float32) * (500.0 / 65535.0)` (urban scale; source clip 500 m).
 - `depth_viz` : 8-bit RGB PNG, Spectral-colormapped log-depth.
   **Preview only — decode `depth` for any metric use.**
-- `normals` : 8-bit RGB PNG of `(n + 1) / 2 * 255`. Decode as
+- `normals` : 8-bit RGB JPEG (q=95) of `(n + 1) / 2 * 255`. Decode as
   `np.asarray(img, np.float32) / 127.5 - 1.0`.

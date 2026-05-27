@@ -4,10 +4,12 @@ Re-encodes `prs-eth/PanoInfinigen` (1.89 TB, 78,362 rows across indoor/nature/ur
 
 | Column      | Source                  | New encoding                       |
 | :---        | :---                    | :---                               |
-| `image`     | PNG (kept as-is)        | PNG (8-bit RGB)                    |
+| `image`     | PNG                     | **JPEG q=95** (transcoded from PNG, ~4-5x smaller, visually lossless) |
 | `depth`     | binary NPY float16      | 16-bit single-channel PNG (per-config scale) |
 | `depth_viz` | *(new)*                 | 8-bit Spectral RGB PNG, log-depth preview |
-| `normals`   | binary NPY float16, (H,W,3) | 8-bit RGB PNG, `(n + 1) / 2 * 255` |
+| `normals`   | binary NPY float16, (H,W,3) | 8-bit RGB **JPEG q=95**, `(n + 1) / 2 * 255` |
+
+All four columns are HF `Image` features. See [`RESEARCH_REPORT.md`](RESEARCH_REPORT.md) for the experimental rationale behind this schema vs. the earlier binary-normals attempt — short version: any binary cell in `/rows` is inlined as base64 with no truncation, and that breaks Data Studio at scale.
 
 Per-config depth max (defined in [`__init__.py`](__init__.py); matches the
 upstream renderer's hard clip so no precision is wasted on unreachable values):
