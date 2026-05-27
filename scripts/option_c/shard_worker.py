@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 
 from .encoder import (
     decode_npy_or_npz,
@@ -173,36 +173,64 @@ def reencode_shard(backup_file: Path, new_file: Path, depth_max_m: float, cpus: 
 
 # ---------- step 3: upload ------------------------------------------------
 
-def upload_shard(
-    local_file: Path,
+def upload_shards_batched(
+    pending: list[tuple[Path, str]],
     target_repo: str,
-    target_path: str,
     api: HfApi | None = None,
     skip_if_present: bool = True,
     commit_message: str | None = None,
-) -> None:
-    """Upload `local_file` to `target_repo` at `target_path` (overwriting)."""
+) -> list[tuple[Path, str]]:
+    """Upload all `(local_file, target_path)` pairs as a single HF commit.
+
+    This avoids one-commit-per-shard, which triggers `JobManagerCrashedError`
+    and "could not squash the history of the commits" failures on HF when
+    many shards land in rapid succession across parallel Slurm tasks.
+
+    Returns the list of pairs that were ACTUALLY uploaded (i.e. those that
+    weren't skipped because the Hub already had matching size). The caller
+    is responsible for cleaning up the local files of the returned pairs.
+    """
+    if not pending:
+        return []
     api = api or HfApi()
+
+    to_upload: list[tuple[Path, str]] = []
     if skip_if_present:
         try:
             info = api.repo_info(target_repo, repo_type="dataset", files_metadata=True)
-            for sib in info.siblings:
-                if sib.rfilename == target_path and sib.size == local_file.stat().st_size:
-                    logger.info("[upload] skip %s (already on Hub with matching size)", target_path)
-                    return
+            hub_sizes = {sib.rfilename: sib.size for sib in info.siblings}
         except Exception as e:
-            logger.warning("[upload] could not check hub state: %s", e)
+            logger.warning("[upload] could not fetch hub sizes: %s", e)
+            hub_sizes = {}
+        for local_file, target_path in pending:
+            if hub_sizes.get(target_path) == local_file.stat().st_size:
+                logger.info("[upload] skip %s (already on Hub with matching size)", target_path)
+            else:
+                to_upload.append((local_file, target_path))
+    else:
+        to_upload = list(pending)
 
+    if not to_upload:
+        return []
+
+    ops = [
+        CommitOperationAdd(path_in_repo=tp, path_or_fileobj=str(lf))
+        for lf, tp in to_upload
+    ]
+    total_mb = sum(lf.stat().st_size for lf, _ in to_upload) / 1024**2
     t = time.time()
-    api.upload_file(
-        path_or_fileobj=str(local_file),
-        path_in_repo=target_path,
+    msg = commit_message or (
+        f"Option C re-encode: batch of {len(to_upload)} shard(s), {total_mb:.0f} MB"
+    )
+    api.create_commit(
         repo_id=target_repo,
         repo_type="dataset",
-        commit_message=commit_message or f"Option C re-encode: {target_path}",
+        operations=ops,
+        commit_message=msg,
     )
     elapsed = time.time() - t
     logger.info(
-        "[upload] %s -> %s  %.1f MB  %.1fs",
-        local_file.name, target_path, local_file.stat().st_size / 1024**2, elapsed,
+        "[upload] batch of %d shards, %.0f MB total, %.1fs (%s)",
+        len(to_upload), total_mb, elapsed, ", ".join(tp.split("/")[-1] for _, tp in to_upload),
     )
+    return to_upload

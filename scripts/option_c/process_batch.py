@@ -43,7 +43,7 @@ from huggingface_hub import HfApi
 
 from . import SOURCE_REPO
 from .manifest import filter_manifest, slice_for_task
-from .shard_worker import backup_shard, reencode_shard, upload_shard
+from .shard_worker import backup_shard, reencode_shard, upload_shards_batched
 
 
 def setup_logging():
@@ -74,6 +74,10 @@ def parse_args():
                     help="phases to run (repeatable). Default: all three.")
     ap.add_argument("--keep-new-after-upload", action="store_true",
                     help="don't delete the local re-encoded shard after a successful upload")
+    ap.add_argument("--upload-batch-size", type=int, default=10,
+                    help="how many shards to bundle into a single HF commit (1-100). "
+                         "Smaller -> more commits but lower scratch peak; larger -> fewer "
+                         "commits but more disk needed before each commit.")
     return ap.parse_args()
 
 
@@ -103,6 +107,16 @@ def main():
     backup_root = Path(args.backup_dir)
     new_root = Path(args.new_dir) if args.new_dir else None
     n_ok, n_err = 0, 0
+    pending: list[tuple[Path, str]] = []  # for batched upload
+
+    def flush_pending():
+        if not pending:
+            return
+        uploaded = upload_shards_batched(pending, args.target_repo, api=api)
+        if not args.keep_new_after_upload:
+            for local_file, _ in uploaded:
+                local_file.unlink(missing_ok=True)
+        pending.clear()
 
     for entry in slice_:
         tag = f"{entry['config']}/{entry['split']}/{entry['shard_name']}"
@@ -120,15 +134,23 @@ def main():
                 if not new_file.exists():
                     raise RuntimeError(f"missing re-encoded shard: {new_file}")
                 target_path = f"{args.target_prefix.rstrip('/')}/{entry['config']}/{entry['shard_name']}"
-                upload_shard(new_file, args.target_repo, target_path, api=api)
-                if not args.keep_new_after_upload:
-                    new_file.unlink(missing_ok=True)
+                pending.append((new_file, target_path))
+                if len(pending) >= max(1, args.upload_batch_size):
+                    flush_pending()
 
             n_ok += 1
             logging.info("[OK] %s", tag)
         except Exception as e:
             n_err += 1
             logging.exception("[FAIL] %s : %s", tag, e)
+
+    # Final flush for the trailing partial batch.
+    if "upload" in phases:
+        try:
+            flush_pending()
+        except Exception as e:
+            n_err += 1
+            logging.exception("[FAIL] final batch upload: %s", e)
 
     logging.info("done: %d ok, %d errored", n_ok, n_err)
     sys.exit(1 if n_err else 0)
