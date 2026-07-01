@@ -437,6 +437,7 @@ def compute_base_views(
     min_candidates_ratio=5,
     max_tries=30000,
     visualize=False,
+    panoramic_enclosure_check=False,
     **kwargs,
 ):
     import time as _time
@@ -539,6 +540,25 @@ def compute_base_views(
                 rejection_counts["inside_building"] += 1
                 continue
 
+            # Panoramic enclosure check (city path): the final render is a full
+            # 360° equirectangular panorama, so a forward pinhole / upward-only
+            # test misses props beside or below the camera. Cast a full sphere of
+            # rays against the (instance-aware) BVH and apply the SAME thresholds
+            # the post-render depth check used, making that check redundant.
+            if panoramic_enclosure_check:
+                max_depth, clip_frac, sky_frac = panoramic_depth_stats(
+                    cam.matrix_world.translation, scene_bvh
+                )
+                if max_depth < 2.0:
+                    rejection_counts["pano_enclosed"] += 1
+                    continue
+                if clip_frac > 0.05:
+                    rejection_counts["pano_clip"] += 1
+                    continue
+                if sky_frac < 0.10:
+                    rejection_counts["pano_low_sky"] += 1
+                    continue
+
             # Compute focus distance
             destination = cam.matrix_world @ Vector((0.0, 0.0, -1.0))
             forward_dir = (destination - cam.location).normalized()
@@ -563,10 +583,133 @@ def compute_base_views(
     return potential_views[:n_views]
 
 
-def build_bvh_and_attrs(objs, tags_queries):
+def build_instance_aware_bvh(exclude_prefix="Culling"):
+    """World-space BVHTree that INCLUDES geometry-node / collection instances.
+
+    ``meshes.new_from_object`` (used by :func:`build_bvh_and_attrs`) only bakes an
+    object's own realized mesh — it is blind to Instance-on-Points / collection
+    instances, so cars, trees, street furniture, façade greebles and windows
+    (which iCity scatters as instances) never enter the BVH. Worse, the source
+    template assets get baked at their authoring location instead of where they
+    render.
+
+    We instead walk the evaluated depsgraph's ``object_instances`` so the tree
+    matches exactly what the renderer rasterizes. Objects/instancers whose name
+    starts with ``exclude_prefix`` (the enclosing culling volumes) are skipped so
+    they don't box in the sky raycast.
+    """
+    import bmesh as _bmesh
+    import time as _time
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+
+    # Cache local (untransformed) triangulated geometry per evaluated mesh so the
+    # thousands of instances that share one asset are meshed only once.
+    local_cache: dict = {}
+
+    def _local_geom(ob):
+        key = ob.data.name
+        if key in local_cache:
+            return local_cache[key]
+        me = bpy.data.meshes.new_from_object(ob)
+        geom = None
+        if me is not None:
+            bm = _bmesh.new()
+            bm.from_mesh(me)
+            _bmesh.ops.triangulate(bm, faces=bm.faces[:])
+            bm.to_mesh(me)
+            bm.free()
+            if len(me.vertices):
+                verts = np.array([v.co[:] for v in me.vertices], dtype=np.float64)
+                faces = [tuple(p.vertices) for p in me.polygons]
+                geom = (verts, faces)
+            bpy.data.meshes.remove(me)
+        local_cache[key] = geom
+        return geom
+
+    all_verts = []
+    all_faces = []
+    voff = 0
+    n_inst = n_base = 0
+    t0 = _time.perf_counter()
+    for inst in depsgraph.object_instances:
+        ob = inst.object
+        if ob is None or ob.type != "MESH" or ob.data is None:
+            continue
+        holder = inst.parent if inst.is_instance else ob
+        if holder is not None and holder.name.startswith(exclude_prefix):
+            continue
+        geom = _local_geom(ob)
+        if geom is None:
+            continue
+        lv, lf = geom
+        M = np.array(inst.matrix_world, dtype=np.float64)
+        all_verts.append(lv @ M[:3, :3].T + M[:3, 3])
+        all_faces.extend((a + voff, b + voff, c + voff) for a, b, c in lf)
+        voff += len(lv)
+        if inst.is_instance:
+            n_inst += 1
+        else:
+            n_base += 1
+
+    if not all_verts:
+        raise ValueError("build_instance_aware_bvh found no geometry")
+
+    verts = np.concatenate(all_verts, axis=0)
+    logger.info(
+        f"build_instance_aware_bvh: {n_base} base + {n_inst} instances -> "
+        f"{len(verts)} verts, {len(all_faces)} tris "
+        f"({_time.perf_counter() - t0:.1f}s)"
+    )
+    return BVHTree.FromPolygons(verts.tolist(), all_faces, all_triangles=True)
+
+
+def panoramic_depth_stats(origin, scene_bvh, n_theta=48, n_phi=96, sky_dist=1e4):
+    """Raycast a full equirectangular sphere of directions from ``origin`` against
+    ``scene_bvh`` and return ``(max_depth, clip_frac, sky_frac)`` with the exact
+    definitions the post-render depth check uses.
+
+    Directions are sampled on a lat/long grid, matching how equirectangular pixels
+    tile the sphere (denser toward the poles), so the returned fractions equal the
+    fractions the rendered depth map would report. Because the statistics are over
+    the whole sphere, they are independent of camera yaw. A missed ray (open sky)
+    counts as ``sky_dist * 10`` so it registers as sky and as a large max depth.
+    """
+    origin = Vector(origin)
+    thetas = np.pi * (np.arange(n_theta) + 0.5) / n_theta
+    phis = 2 * np.pi * (np.arange(n_phi) + 0.5) / n_phi
+    depths = np.empty((n_theta, n_phi), dtype=np.float64)
+    miss = sky_dist * 10
+    for i, th in enumerate(thetas):
+        st, ct = np.sin(th), np.cos(th)
+        for j, ph in enumerate(phis):
+            _, _, _, dist = scene_bvh.ray_cast(
+                origin, Vector((st * np.cos(ph), st * np.sin(ph), ct))
+            )
+            depths[i, j] = miss if dist is None else dist
+    return (
+        float(depths.max()),
+        float((depths < 0.5).mean()),
+        float((depths > sky_dist).mean()),
+    )
+
+
+def build_bvh_and_attrs(objs, tags_queries, include_instances=False):
     import bmesh as _bmesh
     import time as _time
     from infinigen.terrain.utils import Mesh
+
+    # City path: build a BVH that matches the rendered geometry (includes GN /
+    # collection instances). Tag/range selection queries are not supported here
+    # (the urban pipeline passes none), so we return empty selection answers.
+    if include_instances:
+        if tags_queries:
+            logger.warning(
+                "build_bvh_and_attrs(include_instances=True) ignores selection "
+                f"queries {list(tags_queries)}"
+            )
+        return build_instance_aware_bvh(), {}
+
 
     # Build a single triangulated world-space mesh using bmesh, avoiding all
     # bpy.ops calls that require viewport context (fails for hidden collections).
@@ -638,6 +781,7 @@ def camera_selection_preprocessing(
     tags_ratio: dict = None,
     ranges_ratio: dict = None,
     anim_criterion_keys: dict = None,
+    include_instances: bool = False,
 ):
     if tags_ratio is None:
         tags_ratio = {}
@@ -671,7 +815,7 @@ def camera_selection_preprocessing(
 
     if terrain is None:
         scene_bvh, camera_selection_answers = build_bvh_and_attrs(
-            scene_objs, all_selection_ratios.keys()
+            scene_objs, all_selection_ratios.keys(), include_instances=include_instances
         )
         vertexwise_min_dist = None
     else:
