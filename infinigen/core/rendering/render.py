@@ -228,10 +228,18 @@ def configure_compositor_output(
     nw.links.new(image, default_file_output_node.inputs["Image"])
     if saving_ground_truth:
         slot_input.path = "UniqueInstances"
-    else:
-        nw.links.new(image, file_output_node_exr.inputs["Image"])
-        file_slot_list.append(file_output_node_exr.file_slots[slot_input.path])
+    # else (beauty render): the RGB beauty pass is saved as PNG only; we no
+    # longer also write a redundant OPEN_EXR copy of it.
     file_slot_list.append(default_file_output_node.file_slots[slot_input.path])
+
+    # If nothing actually feeds the EXR output node (beauty render with no
+    # EXR-only passes such as material_index), mute it so Blender does not emit
+    # a stray black Image EXR.
+    exr_used = saving_ground_truth or any(
+        p == "material_index" for p, _ in passes_to_save
+    )
+    if not exr_used:
+        file_output_node_exr.mute = True
 
     return file_slot_list
 

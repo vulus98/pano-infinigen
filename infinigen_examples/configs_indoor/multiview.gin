@@ -1,0 +1,33 @@
+# Multi-view panorama capture for Gaussian-Splatting training (INDOOR).
+#
+# Same idea as configs_nature/multiview.gin: one camera rig per scene whose
+# sub-cameras form a small constellation, each rendered as a 360 deg
+# equirectangular panorama with its pose saved. Indoor rooms are small, so the
+# baseline is much smaller than outdoors -- but 15 cm is too little to give the
+# GS head any parallax, so we use ~0.5 m.
+#
+# Load AFTER the indoor base configs, e.g.
+#   --configs singleroom.gin fast_solve.gin multiview.gin
+#
+# IMPORTANT: keep multiview_rig_config.n_views == iterate_scene_tasks.n_subcams
+# (data_schema/multiview.gin); the launcher keeps both in sync from $N_VIEWS.
+
+camera.spawn_camera_rigs.n_camera_rigs = 1
+camera.spawn_camera_rigs.camera_rig_config = @camera.multiview_rig_config()
+
+camera.multiview_rig_config.n_views = 8
+# Baseline drawn uniformly PER SCENE (mean 0.3 m) for baseline diversity. Rooms
+# are small and cluttered -- every sub-camera must stay clear of walls/furniture
+# -- so keep the range modest. Use a plain float to fix it.
+camera.multiview_rig_config.baseline = ("uniform", 0.2, 0.4)   # metres (indoor)
+camera.multiview_rig_config.pattern = "ring"     # "ring" | "sphere"
+camera.multiview_rig_config.z_amplitude = 0.1    # +/- vertical parallax for the ring
+camera.multiview_rig_config.level_pitch_deg = 90 # must match camera_pose_proposal.pitch
+
+# Level, horizon-facing panoramas.
+camera.camera_pose_proposal.pitch = 90
+camera.camera_pose_proposal.roll = 0
+
+# One valid anchor per scene is enough; don't over-search when validating N
+# sub-cameras per candidate.
+compute_base_views.min_candidates_ratio = 1

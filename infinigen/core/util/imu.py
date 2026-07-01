@@ -337,12 +337,15 @@ def save_imu_tum_files(
     """
 
     output_folder = Path(output_folder)
-    output_folder.mkdir(exist_ok=True, parents=True)
 
     anim_objects = [x for x in objects if x.animation_data is not None]
     if len(anim_objects) == 0:
         logger.warning("save_imu_tum_files: No animation data in given objects")
         return
+
+    # Only create the folder once we know there is data to write, so
+    # single-frame (non-animated) renders don't leave an empty imu_tum dir.
+    output_folder.mkdir(exist_ok=True, parents=True)
 
     for i in range(len(objects)):
         try:

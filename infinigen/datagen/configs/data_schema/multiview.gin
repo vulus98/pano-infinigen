@@ -1,0 +1,21 @@
+# Datagen schema for multi-view panorama capture (Gaussian-Splatting training).
+#
+# Like stereo, but with an arbitrary number of sub-cameras: one populated scene
+# is rendered from every sub-camera of a single rig. n_subcams MUST match
+# camera.multiview_rig_config.n_views in the scene config; the launcher sets both
+# from $N_VIEWS.
+
+include 'infinigen/datagen/configs/data_schema/monocular.gin'
+iterate_scene_tasks.n_camera_rigs = 1
+iterate_scene_tasks.n_subcams = 8
+
+iterate_scene_tasks.global_tasks = [
+    {'name': "coarse", 'func': @queue_coarse},
+    {'name': "fineterrain", 'func': @queue_fine_terrain},
+    {'name': "fine", 'func': @queue_populate},
+]
+iterate_scene_tasks.view_dependent_tasks = []
+iterate_scene_tasks.camera_dependent_tasks = [
+    {'name': 'rendershort', 'func': @rendershort/queue_render},
+    {'name': 'renderbackup', 'func': @renderbackup/queue_render, 'condition': 'prev_failed'}
+]

@@ -1,0 +1,43 @@
+# Multi-view panorama capture for Gaussian-Splatting training.
+#
+# A single camera rig is placed at one validated anchor per scene; its
+# sub-cameras form a small constellation (see camera.multiview_rig_config).
+# Every sub-camera is rendered as a full 360 deg equirectangular panorama
+# (render.configure_360_camera) and its pose is saved by save_camera_parameters,
+# so each scene yields several pose-registered panoramas of the SAME content --
+# the multi-view supervision a monocular GS head needs.
+#
+# Load this AFTER the base nature configs, e.g.
+#   --configs simple.gin multiview.gin
+#
+# IMPORTANT: multiview_rig_config.n_views MUST equal
+# iterate_scene_tasks.n_subcams (data_schema/multiview.gin). The launcher keeps
+# both in sync from a single $N_VIEWS variable.
+
+# One rig (one anchor) per scene; the views come from the rig's sub-cameras.
+camera.spawn_camera_rigs.n_camera_rigs = 1
+camera.spawn_camera_rigs.camera_rig_config = @camera.multiview_rig_config()
+
+camera.multiview_rig_config.n_views = 8
+# Baseline trade-off: the GS head must infer geometry from a single monocular
+# panorama, so target views need overlap -- but too small a baseline gives no
+# parallax to supervise. Outdoor scenes are large (content tens of metres away),
+# so they take a much wider baseline than indoor. The ring is world-horizontal
+# (pitch-compensated), so cameras stay at the anchor altitude regardless of size.
+# Baseline is drawn uniformly PER SCENE from this range (mean 0.5 m), so the
+# dataset spans a range of parallaxes and the GS head doesn't overfit to one
+# baseline. Use a plain float instead to fix it. NOTE: with the default low
+# camera altitude (0.5-1 m) on undulating terrain every sub-camera must clear the
+# ground, so keep the upper bound <= ~1.5 m or placement starts to fail.
+camera.multiview_rig_config.baseline = ("uniform", 0.3, 0.7)   # metres (outdoor)
+camera.multiview_rig_config.pattern = "ring"     # "ring" | "sphere"
+camera.multiview_rig_config.z_amplitude = 0.2    # +/- vertical parallax for the ring
+camera.multiview_rig_config.level_pitch_deg = 90 # must match camera_pose_proposal.pitch
+
+# Level, horizon-facing panoramas.
+camera.camera_pose_proposal.pitch = 90
+camera.camera_pose_proposal.roll = 0
+
+# We only need one valid anchor per scene; validating N sub-cameras per candidate
+# is expensive, so don't over-search (mirrors multiview_stereo.gin).
+compute_base_views.min_candidates_ratio = 1

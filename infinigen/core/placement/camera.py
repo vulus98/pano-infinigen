@@ -119,6 +119,110 @@ def get_id(camera: bpy.types.Object):
 
 
 @gin.configurable
+def multiview_rig_config(
+    n_views=8,
+    baseline=0.3,
+    pattern="ring",
+    z_amplitude=0.0,
+    level_pitch_deg=90.0,
+):
+    """Build a ``camera_rig_config`` describing a small multi-view constellation
+    of cameras for panoramic Gaussian-Splatting training data.
+
+    One scene is captured by a single camera *rig* whose sub-cameras form the
+    constellation: a central "anchor" camera plus surrounding cameras a short
+    ``baseline`` (in metres) away. Because each sub-camera is rendered as a full
+    360° equirectangular panorama, even a modest baseline yields useful parallax
+    while every view still observes the same scene content — exactly what a GS
+    head needs for multi-view supervision of a monocular input.
+
+    All sub-cameras keep the rig orientation (``rot_euler`` offset of 0) so their
+    panoramas are consistently oriented; only the positions differ, and each
+    sub-camera's absolute pose is saved by :func:`save_camera_parameters`, so the
+    relative extrinsics between views are recoverable.
+
+    IMPORTANT — pitch compensation: ``spawn_camera_rigs`` applies these offsets in
+    the rig's LOCAL frame, and the rig is rotated to look at the horizon
+    (``camera.camera_pose_proposal.pitch`` ≈ 90°). A raw local offset would then
+    be tilted, mapping the neighbour ring partly onto the world vertical axis —
+    at a large baseline that would drive sub-cameras up to ±baseline metres
+    vertically (i.e. underground). We therefore build the desired constellation
+    in a level world frame and pre-rotate it by the inverse of the rig pitch, so
+    that once the rig tilts, the spread ends up HORIZONTAL in world space
+    (only ``z_amplitude`` contributes vertical parallax). ``level_pitch_deg`` must
+    match ``camera.camera_pose_proposal.pitch``.
+
+    NOTE: ``n_views`` here must equal ``iterate_scene_tasks.n_subcams`` in the
+    datagen pipeline config, otherwise the render loop will not iterate every
+    sub-camera. The launcher keeps the two in sync from a single variable.
+
+    Args:
+        n_views: total number of cameras (1 anchor + ``n_views-1`` neighbours).
+        baseline: distance of the neighbour cameras from the anchor, in metres.
+            Accepts a ``random_general`` spec, e.g. ``("uniform", 0.3, 0.7)``, in
+            which case a FRESH baseline is drawn for each generated scene. Varying
+            the baseline across the dataset stops the GS head from overfitting to
+            a single parallax and helps it generalise to different view spacings;
+            a plain float keeps it fixed.
+        pattern: ``"ring"`` places neighbours on a (world) horizontal circle;
+            ``"sphere"`` spreads them over a Fibonacci upper-hemisphere.
+        z_amplitude: for ``"ring"``, alternate neighbour cameras up/down by this
+            amount (metres) to add vertical parallax. Ignored for ``"sphere"``.
+            Also accepts a ``random_general`` spec.
+        level_pitch_deg: pitch (deg) the rig will be placed at; used to keep the
+            constellation world-horizontal. Must match camera_pose_proposal.pitch.
+
+    Returns:
+        list[dict] with ``loc``/``rot_euler`` keys, consumable by
+        :func:`spawn_camera_rigs`.
+    """
+    if n_views < 1:
+        raise ValueError(f"multiview_rig_config needs n_views>=1, got {n_views}")
+
+    # Draw the baseline / vertical amplitude once per scene (this runs inside the
+    # per-scene worker with its seed set), so a ("uniform", lo, hi) spec yields a
+    # different -- but reproducible -- baseline for every scene.
+    baseline = random_general(baseline)
+    z_amplitude = random_general(z_amplitude)
+
+    # Desired offsets in a LEVEL world frame (x,y horizontal, z up).
+    world_offsets = [(0.0, 0.0, 0.0)]  # anchor
+    m = n_views - 1
+    if pattern == "sphere":
+        # Fibonacci hemisphere: even angular spread over the upper half sphere.
+        golden = np.pi * (3.0 - np.sqrt(5.0))
+        for i in range(m):
+            z = (i + 0.5) / m  # (0, 1) -> upper hemisphere only
+            r = np.sqrt(max(0.0, 1.0 - z * z))
+            theta = golden * i
+            world_offsets.append(
+                (baseline * r * np.cos(theta), baseline * r * np.sin(theta), baseline * z)
+            )
+    elif pattern == "ring":
+        for i in range(m):
+            theta = 2.0 * np.pi * i / m
+            z = z_amplitude * (1.0 if i % 2 == 0 else -1.0) if z_amplitude else 0.0
+            world_offsets.append((baseline * np.cos(theta), baseline * np.sin(theta), z))
+    else:
+        raise ValueError(f"multiview_rig_config: unknown pattern {pattern!r}")
+
+    # Pre-rotate by Rx(-pitch) so that after the rig applies Rx(pitch) the spread
+    # is world-horizontal. (Yaw about world-Z, applied on top, keeps it level.)
+    p = np.deg2rad(level_pitch_deg)
+    cp, sp = np.cos(p), np.sin(p)
+    cfg = []
+    for wx, wy, wz in world_offsets:
+        loc = (
+            float(wx),
+            float(cp * wy + sp * wz),
+            float(-sp * wy + cp * wz),
+        )
+        cfg.append({"loc": loc, "rot_euler": (0.0, 0.0, 0.0)})
+
+    return cfg
+
+
+@gin.configurable
 def spawn_camera_rigs(
     camera_rig_config,
     n_camera_rigs,
