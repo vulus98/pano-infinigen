@@ -82,8 +82,50 @@ elif [ "$SCENE_TYPE" == "multiview" ]; then
     echo "Building multi-view pose manifests..."
     python build_multiview_manifest.py --root "$base_output" || echo "manifest build failed (non-fatal)"
 
+elif [ "$SCENE_TYPE" == "harvest" ]; then
+    # Decoupled workflow (one array task = one scene): generate ONE scene once
+    # (the expensive part), then harvest several multi-view panorama sets from it
+    # with harvest_multiview.py. Failed placements are free retries on the saved
+    # scene; each rig gets its own (optionally random) baseline.
+    #   Time scales with RIGS_PER_SCENE * N_VIEWS * resolution -- tune to fit the
+    #   SBATCH --time budget (full-res renders are minutes each).
+    N_VIEWS=${N_VIEWS:-8}
+    RIGS_PER_SCENE=${RIGS_PER_SCENE:-4}
+    BASELINE=${BASELINE:-uniform,0.3,0.7}
+    RES=${RES:-4096,2048}
+    SAMPLE_RADIUS=${SAMPLE_RADIUS:-30}
+    scene_dir="${base_output}/scene"
+    mv_dir="${base_output}/multiview"
+
+    # Generate the scene with a THROWAWAY tiny render: manage_jobs only reports a
+    # scene "done" once its render tasks succeed, so we keep a 64x32 / 1-sample
+    # render (a few seconds) rather than dropping renders entirely. The real
+    # panoramas are rendered by harvest_multiview.py at full RES below.
+    echo "Generating one scene (tiny throwaway render)..."
+    python -m infinigen.datagen.manage_jobs --output_folder "$scene_dir" --num_scenes 1 \
+        --configs simple.gin \
+        --pipeline_configs local_256GB.gin monocular.gin blender_gt.gin \
+        --pipeline_overrides LocalScheduleHandler.use_gpu=True manage_datagen_jobs.num_concurrent=1 \
+        --overrides camera.camera_pose_proposal.pitch=90 camera.camera_pose_proposal.roll=0 \
+            "render_image.render_resolution_override=(64, 32)" "execute_tasks.generate_resolution=(64, 32)" \
+            "configure_render_cycles.num_samples=1" \
+        --wandb_mode disabled
+
+    blend=$(find "$scene_dir" -path '*fine/scene.blend' 2>/dev/null | head -1)
+    if [ -z "$blend" ]; then
+        echo "ERROR: scene generation produced no fine/scene.blend"; exit 1
+    fi
+    echo "Harvesting ${RIGS_PER_SCENE} multi-view set(s) from $blend ..."
+    python harvest_multiview.py --scene-blend "$blend" --output "$mv_dir" \
+        --rigs-per-scene "$RIGS_PER_SCENE" --n-views "$N_VIEWS" --baseline "$BASELINE" \
+        --resolution "$RES" --sample-radius "$SAMPLE_RADIUS" --seed "${SLURM_ARRAY_TASK_ID:-0}"
+
+    # The multi-view sets are in $mv_dir; the source scene (incl. the ~1-2 GB
+    # scene.blend) is no longer needed.
+    rm -rf "$scene_dir"
+
 else
-    echo "Error: Unknown SCENE_TYPE '$SCENE_TYPE'. Use 'indoor', 'outdoor', or 'multiview'."
+    echo "Error: Unknown SCENE_TYPE '$SCENE_TYPE'. Use 'indoor', 'outdoor', 'multiview', or 'harvest'."
     exit 1
 fi
 
@@ -103,3 +145,5 @@ echo "$(date) finished ${SLURM_JOB_ID}"
 #   sbatch --export=ALL,SCENE_TYPE=multiview,N_VIEWS=8 run_slurm.sh
 # Multi-view indoor (0.3 m baseline):
 #   sbatch --export=ALL,SCENE_TYPE=multiview,MV_DOMAIN=indoor,N_VIEWS=8 run_slurm.sh
+# Harvest (array; each task = 1 generated scene -> RIGS_PER_SCENE multi-view sets):
+#   sbatch --array=1-500 --export=ALL,SCENE_TYPE=harvest,RIGS_PER_SCENE=4,N_VIEWS=8 run_slurm.sh

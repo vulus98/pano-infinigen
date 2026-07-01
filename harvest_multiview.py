@@ -131,13 +131,21 @@ def panoramic_sky_frac(origin, bvh, n_theta=24, n_phi=48, sky_dist=1e4):
 # --------------------------------------------------------------------------- #
 # Placement.
 # --------------------------------------------------------------------------- #
-def scene_xy_bounds(all_verts, central=0.6):
-    """Central `central` fraction of the scene's XY extent (avoids the borders /
-    spherical-mesher skirt), and the z range for ground raycasts."""
+def sampling_bounds(all_verts, gen_cam_locs, radius, central):
+    """XY box + z range to sample anchors in. Prefer a box of +/- `radius` m
+    around the generation camera(s) -- where assets were populated -- and fall
+    back to the central `central` fraction of the scene if there were none."""
     lo, hi = all_verts.min(0), all_verts.max(0)
-    cx, cy = (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2
-    hx, hy = (hi[0] - lo[0]) / 2 * central, (hi[1] - lo[1]) / 2 * central
-    return (cx - hx, cx + hx, cy - hy, cy + hy, float(lo[2]), float(hi[2]))
+    if gen_cam_locs:
+        cx = float(np.mean([l[0] for l in gen_cam_locs]))
+        cy = float(np.mean([l[1] for l in gen_cam_locs]))
+        x0, x1 = max(lo[0], cx - radius), min(hi[0], cx + radius)
+        y0, y1 = max(lo[1], cy - radius), min(hi[1], cy + radius)
+    else:
+        cx, cy = (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2
+        hx, hy = (hi[0] - lo[0]) / 2 * central, (hi[1] - lo[1]) / 2 * central
+        x0, x1, y0, y1 = cx - hx, cx + hx, cy - hy, cy + hy
+    return (float(x0), float(x1), float(y0), float(y1), float(lo[2]), float(hi[2]))
 
 
 def find_and_place_anchor(rig, cams, bvh, bounds, altitude, min_clear, min_sky, tries):
@@ -223,9 +231,15 @@ def harvest_scene(blend_path, out_root, args):
     out_dir = out_root / scene_name
     logger.info(f"=== scene {scene_name}: loading {blend_path} ===")
     bpy.ops.wm.open_mainfile(filepath=str(blend_path), load_ui=False)
-    # The generated scene ships with its own camera rig (e.g. camera_0_0). Remove
-    # it so our harvested rigs get clean, collision-free camera_<rig>_<subcam>
-    # names (Blender would otherwise suffix them ".001", breaking get_id()).
+    # Infinigen populates high-res assets only around the generation camera(s)
+    # (within dist_cull). Remember where they were so we sample new anchors there
+    # -- otherwise a harvested panorama would look out over bare terrain.
+    gen_cam_locs = [
+        o.matrix_world.translation.copy() for o in bpy.data.objects if o.type == "CAMERA"
+    ]
+    # Remove the generation rig so our harvested rigs get clean, collision-free
+    # camera_<rig>_<subcam> names (Blender would otherwise suffix them ".001",
+    # breaking get_id()).
     for obj in list(bpy.data.objects):
         if obj.type == "CAMERA" or obj.name.startswith(("camrig", "camera_")):
             bpy.data.objects.remove(obj, do_unlink=True)
@@ -235,7 +249,7 @@ def harvest_scene(blend_path, out_root, args):
     scene.render.resolution_x, scene.render.resolution_y = args.resolution
 
     bvh, all_verts = build_instance_aware_bvh()
-    bounds = scene_xy_bounds(all_verts, central=args.central)
+    bounds = sampling_bounds(all_verts, gen_cam_locs, args.sample_radius, args.central)
 
     placed = []
     for k in range(args.rigs_per_scene):
@@ -305,7 +319,11 @@ def main():
                     help="metres above ground; float or 'uniform,lo,hi'")
     ap.add_argument("--resolution", type=lambda s: [int(x) for x in s.split(",")], default=[4096, 2048])
     ap.add_argument("--samples", type=int, default=20)
-    ap.add_argument("--central", type=float, default=0.6, help="central XY fraction to sample anchors in")
+    ap.add_argument("--sample-radius", type=float, default=30.0,
+                    help="sample anchors within this many metres of the generation "
+                    "camera(s), where assets are populated (keep < dist_cull ~70 m)")
+    ap.add_argument("--central", type=float, default=0.6,
+                    help="fallback: central XY fraction if the scene had no cameras")
     ap.add_argument("--min-clearance", type=float, default=0.3, help="min metres from any surface per sub-camera")
     ap.add_argument("--min-sky", type=float, default=0.1, help="min open-sky fraction at the anchor")
     ap.add_argument("--place-tries", type=int, default=3000)
