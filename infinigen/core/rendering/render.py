@@ -325,14 +325,9 @@ def _configure_compositor_output_blender5(
     nw.links.new(image, image_node.inputs[image_name])
     file_slot_list.append(image_node)
 
-    # If nothing actually feeds the EXR output node (beauty render with no
-    # EXR-only passes such as material_index), mute it so Blender does not emit
-    # a stray black Image EXR.
-    exr_used = saving_ground_truth or any(
-        p == "material_index" for p, _ in passes_to_save
-    )
-    if not exr_used:
-        file_output_node_exr.mute = True
+    # NOTE: the legacy-path RGB-EXR suppression does not apply here -- in Blender
+    # 5.0 every pass is written as EXR by necessity and converted in
+    # post-processing, so there is no separate PNG/EXR node to mute.
 
     return file_slot_list
 
