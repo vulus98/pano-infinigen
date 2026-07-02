@@ -73,6 +73,13 @@ class AttributeType:
     FloatVector = "FLOAT_VECTOR"
     FloatColor = "FLOAT_COLOR"
     Boolean = "BOOLEAN"
+    # Blender 4.0+ / 5.0 additions
+    Float2 = "FLOAT2"
+    Int8 = "INT8"
+    Int32_2D = "INT32_2D"
+    Quaternion = "QUATERNION"
+    Float4x4 = "FLOAT4X4"
+    ByteColor = "BYTE_COLOR"
 
 
 class FieldsType:
@@ -88,6 +95,12 @@ ATTRTYPE_DIMS = {
     AttributeType.FloatVector: 3,
     AttributeType.FloatColor: 4,
     AttributeType.Boolean: 1,
+    AttributeType.Float2: 2,
+    AttributeType.Int8: 1,
+    AttributeType.Int32_2D: 2,
+    AttributeType.Quaternion: 4,
+    AttributeType.Float4x4: 16,
+    AttributeType.ByteColor: 4,
 }
 
 ATTRTYPE_FIELDS = {
@@ -96,6 +109,12 @@ ATTRTYPE_FIELDS = {
     AttributeType.FloatVector: FieldsType.Vector,
     AttributeType.FloatColor: FieldsType.Color,
     AttributeType.Boolean: FieldsType.Value,
+    AttributeType.Float2: FieldsType.Vector,
+    AttributeType.Int8: FieldsType.Value,
+    AttributeType.Int32_2D: FieldsType.Vector,
+    AttributeType.Quaternion: FieldsType.Value,
+    AttributeType.Float4x4: FieldsType.Value,
+    AttributeType.ByteColor: FieldsType.Color,
 }
 
 ATTRTYPE_NP = {

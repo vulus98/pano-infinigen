@@ -13,7 +13,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
-
+from mathutils import Matrix
 import bpy
 import gin
 import imageio
@@ -102,8 +102,10 @@ def get_sensor_coords(cam, H, W, sparse=False):
     return cam_coords_vectors, pixel_locs
 
 def spawn_camera():
-    bpy.ops.object.camera_add()
-    cam = bpy.context.active_object
+    cam_data = bpy.data.cameras.new("Camera")
+    cam = bpy.data.objects.new("Camera", cam_data)
+    bpy.context.scene.collection.objects.link(cam)
+    bpy.context.view_layer.objects.active = cam
     cam.data.clip_end = 1e4
     adjust_camera_sensor(cam)
     return cam
@@ -293,7 +295,9 @@ def terrain_camera_query(
     min_dist=0,
 ):
     dists = []
-    sensor_coords, pix_it = get_sensor_coords(cam, sparse=True)
+    H = bpy.context.scene.render.resolution_y
+    W = bpy.context.scene.render.resolution_x
+    sensor_coords, pix_it = get_sensor_coords(cam, H=H, W=W, sparse=True)
     terrain_tags_queries_counts = {q: 0 for q in terrain_tags_queries}
 
     for x, y in pix_it:
@@ -438,7 +442,7 @@ def keep_cam_pose_proposal(
     v, i, dist_to_placeholder = placeholders_kd.find(cam.matrix_world.translation)
     if dist_to_placeholder is not None and dist_to_placeholder < min_placeholder_dist:
         logger.debug(f"keep_cam_pose_proposal rejects {dist_to_placeholder=}, {v, i}")
-        return None
+        return "placeholder"
 
     dists, camera_selection_answers_counts, n_pix = terrain_camera_query(
         cam,
@@ -450,7 +454,7 @@ def keep_cam_pose_proposal(
 
     if dists is None:
         logger.debug("keep_cam_pose_proposal rejects terrain dists")
-        return None
+        return "min_dist"
 
     coverage = len(dists) / n_pix
     if terrain_coverage_range is not None and (
@@ -458,16 +462,12 @@ def keep_cam_pose_proposal(
         or coverage > terrain_coverage_range[1]
         or coverage == 0
     ):
-        logger.debug(
-            f"keep_cam_pose_proposal rejects {coverage=} for {terrain_coverage_range=}"
-        )
-        return None
+        logger.debug(f"keep_cam_pose_proposal rejects {coverage=} for {terrain_coverage_range=}")
+        return f"coverage={coverage:.3f}"
 
     if terrain is not None and terrain_sdf <= 0:
-        logger.debug(
-            f"keep_cam_pose_proposal rejects {terrain_sdf=} for {cam.matrix_world.translation=}"
-        )
-        return None
+        logger.debug(f"keep_cam_pose_proposal rejects {terrain_sdf=}")
+        return "terrain_sdf"
 
     if rparams := camera_selection_ratio:
         for q in rparams:
@@ -475,26 +475,22 @@ def keep_cam_pose_proposal(
                 closeup = len([d for d in dists if d < q[1]]) / n_pix
                 if closeup < rparams[q][0] or closeup > rparams[q][1]:
                     logger.debug(f"keep_cam_pose_proposal rejects {closeup=} for {q=}")
-                    return None
+                    return f"closeup={closeup:.3f}"
             else:
                 minv, maxv = rparams[q][0], rparams[q][1]
                 if q in camera_selection_answers_counts:
                     ratio = camera_selection_answers_counts[q] / n_pix
                     if ratio < minv or ratio > maxv:
-                        logger.debug(
-                            f"keep_cam_pose_proposal rejects {ratio=} for {q=}"
-                        )
-                        return None
-    
-    try: 
+                        logger.debug(f"keep_cam_pose_proposal rejects {ratio=} for {q=}")
+                        return f"selection_ratio={ratio:.3f}"
+
+    try:
         res = np.std(dists) + 1.5 * np.min(dists)
     except ValueError:
-        logger.debug(
-            f"Dists empty."
-        )
+        logger.debug("Dists empty.")
         res = 0
-    
-    return res 
+
+    return res
 
 
 @gin.configurable
@@ -542,13 +538,19 @@ def compute_base_views(
     radius=None,
     bbox=None,
     placeholders_kd=None,
-    min_candidates_ratio=20,
+    min_candidates_ratio=5,
     max_tries=30000,
     visualize=False,
+    panoramic_enclosure_check=False,
     **kwargs,
 ):
+    import time as _time
+    from collections import Counter as _Counter
+
     potential_views = []
     n_min_candidates = int(min_candidates_ratio * n_views)
+    rejection_counts = _Counter()
+    t_start = _time.perf_counter()
 
     with tqdm(total=n_min_candidates, desc="Searching for camera viewpoints") as pbar:
         for it in range(1, max_tries):
@@ -566,9 +568,15 @@ def compute_base_views(
                 )
 
             if props is None:
-                logger.debug(
-                    f"{camera_pose_proposal.__name__} returned {props=} for {it=}"
-                )
+                logger.debug(f"{camera_pose_proposal.__name__} returned {props=} for {it=}")
+                rejection_counts["pose_proposal=None"] += 1
+                if it % 500 == 0:
+                    elapsed = _time.perf_counter() - t_start
+                    logger.info(
+                        f"compute_base_views: {it}/{max_tries} tries, "
+                        f"{len(potential_views)}/{n_min_candidates} candidates found "
+                        f"({elapsed:.0f}s elapsed). Rejections: {dict(rejection_counts)}"
+                    )
                 continue
 
             props.apply(camera_rig)
@@ -584,10 +592,25 @@ def compute_base_views(
                 )
                 all_scores.append(score)
 
-            if any(score is None for score in all_scores):
+            if any(isinstance(s, str) for s in all_scores):
+                # keep_cam_pose_proposal returned a rejection reason string
+                for s in all_scores:
+                    if isinstance(s, str):
+                        rejection_counts[s] += 1
+                criterion = None
+            elif any(s is None for s in all_scores):
+                rejection_counts["score=None"] += 1
                 criterion = None
             else:
                 criterion = np.mean(all_scores)
+
+            if it % 500 == 0:
+                elapsed = _time.perf_counter() - t_start
+                logger.info(
+                    f"compute_base_views: {it}/{max_tries} tries, "
+                    f"{len(potential_views)}/{n_min_candidates} candidates found "
+                    f"({elapsed:.0f}s elapsed). Rejections: {dict(rejection_counts)}"
+                )
 
             if visualize:
                 criterion_str = f"{criterion:.2f}" if criterion is not None else "None"
@@ -598,6 +621,47 @@ def compute_base_views(
             if criterion is None:
                 logger.debug(f"{it=} {criterion=}")
                 continue
+
+            # Sky-visibility check: raycast UPWARD only. Horizontal rays are
+            # unreliable — wide buildings have walls 50-100m away, giving false
+            # "open" readings. Ceilings are always close if you're indoors.
+            MAX_CEILING_DIST = 200.0  # no real building taller than this
+            MIN_OPEN_FRAC = 0.3       # at least 30% of upward rays must see sky
+            cam_loc = cam.matrix_world.translation
+            sky_dirs = [Vector((0, 0, 1))]  # straight up
+            for angle in range(0, 360, 30):  # 12 rays at ~27° from vertical
+                r = np.deg2rad(angle)
+                sky_dirs.append(Vector((0.5 * np.cos(r), 0.5 * np.sin(r), 1)).normalized())
+            for angle in range(0, 360, 30):  # 12 rays at ~45° from vertical
+                r = np.deg2rad(angle)
+                sky_dirs.append(Vector((np.cos(r), np.sin(r), 1)).normalized())
+            open_rays = 0
+            for d in sky_dirs:
+                hit, _, _, dist = scene_bvh.ray_cast(cam_loc, d)
+                if hit is None or dist > MAX_CEILING_DIST:
+                    open_rays += 1
+            if open_rays / len(sky_dirs) < MIN_OPEN_FRAC:
+                rejection_counts["inside_building"] += 1
+                continue
+
+            # Panoramic enclosure check (city path): the final render is a full
+            # 360° equirectangular panorama, so a forward pinhole / upward-only
+            # test misses props beside or below the camera. Cast a full sphere of
+            # rays against the (instance-aware) BVH and apply the SAME thresholds
+            # the post-render depth check used, making that check redundant.
+            if panoramic_enclosure_check:
+                max_depth, clip_frac, sky_frac = panoramic_depth_stats(
+                    cam.matrix_world.translation, scene_bvh
+                )
+                if max_depth < 2.0:
+                    rejection_counts["pano_enclosed"] += 1
+                    continue
+                if clip_frac > 0.05:
+                    rejection_counts["pano_clip"] += 1
+                    continue
+                if sky_frac < 0.10:
+                    rejection_counts["pano_low_sky"] += 1
+                    continue
 
             # Compute focus distance
             destination = cam.matrix_world @ Vector((0.0, 0.0, -1.0))
@@ -615,36 +679,181 @@ def compute_base_views(
             butil.save_blend("compute_base_views-failed.blend")
         raise ValueError(f"Could not find {n_views} camera views")
 
-    views = sorted(potential_views, reverse=True)
+    # Shuffle instead of sorting by openness score — we don't want to bias
+    # toward wide-open areas, any outdoor camera that passed the sky check
+    # is valid even if it's near walls.
+    np.random.shuffle(potential_views)
 
-    return views[:n_views]
+    return potential_views[:n_views]
 
 
-def build_bvh_and_attrs(objs, tags_queries):
-    dup_objs = []
-    for obj in objs:
-        with SelectObjects(obj):
-            bpy.ops.object.duplicate(linked=0, mode="TRANSLATION")
-            dup_objs.append(bpy.context.view_layer.objects.active)
-    for obj in dup_objs:
-        with butil.ViewportMode(obj, "EDIT"):
-            bpy.ops.mesh.select_all(action="SELECT")
-            bpy.ops.mesh.quads_convert_to_tris(
-                quad_method="BEAUTY", ngon_method="BEAUTY"
+def build_instance_aware_bvh(exclude_prefix="Culling"):
+    """World-space BVHTree that INCLUDES geometry-node / collection instances.
+
+    ``meshes.new_from_object`` (used by :func:`build_bvh_and_attrs`) only bakes an
+    object's own realized mesh — it is blind to Instance-on-Points / collection
+    instances, so cars, trees, street furniture, façade greebles and windows
+    (which iCity scatters as instances) never enter the BVH. Worse, the source
+    template assets get baked at their authoring location instead of where they
+    render.
+
+    We instead walk the evaluated depsgraph's ``object_instances`` so the tree
+    matches exactly what the renderer rasterizes. Objects/instancers whose name
+    starts with ``exclude_prefix`` (the enclosing culling volumes) are skipped so
+    they don't box in the sky raycast.
+    """
+    import bmesh as _bmesh
+    import time as _time
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+
+    # Cache local (untransformed) triangulated geometry per evaluated mesh so the
+    # thousands of instances that share one asset are meshed only once.
+    local_cache: dict = {}
+
+    def _local_geom(ob):
+        key = ob.data.name
+        if key in local_cache:
+            return local_cache[key]
+        me = bpy.data.meshes.new_from_object(ob)
+        geom = None
+        if me is not None:
+            bm = _bmesh.new()
+            bm.from_mesh(me)
+            _bmesh.ops.triangulate(bm, faces=bm.faces[:])
+            bm.to_mesh(me)
+            bm.free()
+            if len(me.vertices):
+                verts = np.array([v.co[:] for v in me.vertices], dtype=np.float64)
+                faces = [tuple(p.vertices) for p in me.polygons]
+                geom = (verts, faces)
+            bpy.data.meshes.remove(me)
+        local_cache[key] = geom
+        return geom
+
+    all_verts = []
+    all_faces = []
+    voff = 0
+    n_inst = n_base = 0
+    t0 = _time.perf_counter()
+    for inst in depsgraph.object_instances:
+        ob = inst.object
+        if ob is None or ob.type != "MESH" or ob.data is None:
+            continue
+        holder = inst.parent if inst.is_instance else ob
+        if holder is not None and holder.name.startswith(exclude_prefix):
+            continue
+        geom = _local_geom(ob)
+        if geom is None:
+            continue
+        lv, lf = geom
+        M = np.array(inst.matrix_world, dtype=np.float64)
+        all_verts.append(lv @ M[:3, :3].T + M[:3, 3])
+        all_faces.extend((a + voff, b + voff, c + voff) for a, b, c in lf)
+        voff += len(lv)
+        if inst.is_instance:
+            n_inst += 1
+        else:
+            n_base += 1
+
+    if not all_verts:
+        raise ValueError("build_instance_aware_bvh found no geometry")
+
+    verts = np.concatenate(all_verts, axis=0)
+    logger.info(
+        f"build_instance_aware_bvh: {n_base} base + {n_inst} instances -> "
+        f"{len(verts)} verts, {len(all_faces)} tris "
+        f"({_time.perf_counter() - t0:.1f}s)"
+    )
+    return BVHTree.FromPolygons(verts.tolist(), all_faces, all_triangles=True)
+
+
+def panoramic_depth_stats(origin, scene_bvh, n_theta=48, n_phi=96, sky_dist=1e4):
+    """Raycast a full equirectangular sphere of directions from ``origin`` against
+    ``scene_bvh`` and return ``(max_depth, clip_frac, sky_frac)`` with the exact
+    definitions the post-render depth check uses.
+
+    Directions are sampled on a lat/long grid, matching how equirectangular pixels
+    tile the sphere (denser toward the poles), so the returned fractions equal the
+    fractions the rendered depth map would report. Because the statistics are over
+    the whole sphere, they are independent of camera yaw. A missed ray (open sky)
+    counts as ``sky_dist * 10`` so it registers as sky and as a large max depth.
+    """
+    origin = Vector(origin)
+    thetas = np.pi * (np.arange(n_theta) + 0.5) / n_theta
+    phis = 2 * np.pi * (np.arange(n_phi) + 0.5) / n_phi
+    depths = np.empty((n_theta, n_phi), dtype=np.float64)
+    miss = sky_dist * 10
+    for i, th in enumerate(thetas):
+        st, ct = np.sin(th), np.cos(th)
+        for j, ph in enumerate(phis):
+            _, _, _, dist = scene_bvh.ray_cast(
+                origin, Vector((st * np.cos(ph), st * np.sin(ph), ct))
             )
-    with SelectObjects(dup_objs[0]):
-        for obj in dup_objs[1:]:
-            obj.select_set(True)
-        bpy.ops.object.join()
-        obj = bpy.context.view_layer.objects.active
+            depths[i, j] = miss if dist is None else dist
+    return (
+        float(depths.max()),
+        float((depths < 0.5).mean()),
+        float((depths > sky_dist).mean()),
+    )
 
-    bvh = BVHTree.FromObject(obj, bpy.context.evaluated_depsgraph_get())
+
+def build_bvh_and_attrs(objs, tags_queries, include_instances=False):
+    import bmesh as _bmesh
+    import time as _time
     from infinigen.terrain.utils import Mesh
 
-    with butil.ViewportMode(obj, "EDIT"):
-        bpy.ops.mesh.quads_convert_to_tris(quad_method="BEAUTY", ngon_method="BEAUTY")
-    mesh = Mesh(obj=obj)
-    delete(obj)
+    # City path: build a BVH that matches the rendered geometry (includes GN /
+    # collection instances). Tag/range selection queries are not supported here
+    # (the urban pipeline passes none), so we return empty selection answers.
+    if include_instances:
+        if tags_queries:
+            logger.warning(
+                "build_bvh_and_attrs(include_instances=True) ignores selection "
+                f"queries {list(tags_queries)}"
+            )
+        return build_instance_aware_bvh(), {}
+
+
+    # Build a single triangulated world-space mesh using bmesh, avoiding all
+    # bpy.ops calls that require viewport context (fails for hidden collections).
+    combined_bm = _bmesh.new()
+
+    mesh_objs = [o for o in objs if o.type == "MESH" and o.data is not None]
+    logger.info(f"build_bvh_and_attrs: processing {len(mesh_objs)} mesh objects")
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    t0 = _time.perf_counter()
+    for i, obj in enumerate(mesh_objs):
+        logger.info(f"  [{i+1}/{len(mesh_objs)}] Evaluating '{obj.name}' "
+                    f"(verts={len(obj.data.vertices)}, faces={len(obj.data.polygons)})")
+        obj_eval = obj.evaluated_get(depsgraph)
+        mesh_data = bpy.data.meshes.new_from_object(obj_eval)
+        # Apply world transform so all geometry is in world space
+        mesh_data.transform(obj.matrix_world)
+        # Triangulate
+        bm = _bmesh.new()
+        bm.from_mesh(mesh_data)
+        _bmesh.ops.triangulate(bm, faces=bm.faces[:], quad_method="BEAUTY", ngon_method="BEAUTY")
+        bm.to_mesh(mesh_data)
+        bm.free()
+        combined_bm.from_mesh(mesh_data)
+        bpy.data.meshes.remove(mesh_data)
+    logger.info(f"build_bvh_and_attrs: mesh merging done in {_time.perf_counter()-t0:.1f}s, "
+                f"combined verts={len(combined_bm.verts)}, faces={len(combined_bm.faces)}")
+
+    # Create a temporary mesh object for BVH construction and Mesh reading
+    temp_mesh = bpy.data.meshes.new("_bvh_temp")
+    combined_bm.to_mesh(temp_mesh)
+    combined_bm.free()
+    temp_obj = bpy.data.objects.new("_bvh_temp", temp_mesh)
+    bpy.context.scene.collection.objects.link(temp_obj)
+
+    logger.info("build_bvh_and_attrs: building BVHTree...")
+    t1 = _time.perf_counter()
+    bvh = BVHTree.FromObject(temp_obj, bpy.context.evaluated_depsgraph_get())
+    logger.info(f"build_bvh_and_attrs: BVHTree done in {_time.perf_counter()-t1:.1f}s")
+    mesh = Mesh(obj=temp_obj)
+    delete(temp_obj)
 
     camera_selection_answers = {}
     for q0 in tags_queries:
@@ -676,6 +885,7 @@ def camera_selection_preprocessing(
     tags_ratio: dict = None,
     ranges_ratio: dict = None,
     anim_criterion_keys: dict = None,
+    include_instances: bool = False,
 ):
     if tags_ratio is None:
         tags_ratio = {}
@@ -709,7 +919,7 @@ def camera_selection_preprocessing(
 
     if terrain is None:
         scene_bvh, camera_selection_answers = build_bvh_and_attrs(
-            scene_objs, all_selection_ratios.keys()
+            scene_objs, all_selection_ratios.keys(), include_instances=include_instances
         )
         vertexwise_min_dist = None
     else:

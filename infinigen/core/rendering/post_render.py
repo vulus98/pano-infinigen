@@ -9,6 +9,7 @@ import logging
 import os
 
 import OpenEXR
+import Imath # Needed for robust EXR loading
 
 # ruff: noqa: E402
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"  # This must be done BEFORE import cv2.
@@ -49,29 +50,33 @@ def roll_normals_equirect(normals: np.ndarray, shift_x: float) -> np.ndarray:
     if normals.ndim != 3:
         raise ValueError(f"Expected normals to have 3 dims (H,W,3 or 3,H,W), got {normals.shape}")
 
-    if normals.shape[-1] == 3:
-        normals_chw = np.moveaxis(normals, -1, 0)
-        moved_axis = True
-    elif normals.shape[0] == 3:
-        normals_chw = normals
-        moved_axis = False
-    else:
-        raise ValueError(f"Expected last or first dim to be 3, got {normals.shape}")
-
-    _, H, W = normals_chw.shape
-
     angle = -2.0 * np.pi * shift_x
     cos_a, sin_a = np.cos(angle), np.sin(angle)
     R = np.array(
         [[cos_a, 0.0, -sin_a], [0.0, 1.0, 0.0], [sin_a, 0.0, cos_a]],
-        dtype=normals_chw.dtype,
+        dtype=normals.dtype,
     )
 
-    n_flat = normals_chw.reshape(3, -1)
-    rotated = (R @ n_flat).reshape(3, H, W)
-    if moved_axis:
-        return np.moveaxis(rotated, 0, -1)
-    return rotated
+    if normals.shape[-1] == 3:
+        # (H, W, 3) case - native layout processing for performance
+        H, W, _ = normals.shape
+        # Flatten to (N, 3). No copy if input is contiguous.
+        n_flat = normals.reshape(-1, 3) 
+        
+        # v' = R v. For row vectors: v' = v R.T
+        rotated_flat = n_flat @ R.T
+        
+        # Result is (H, W, 3) contiguous
+        return rotated_flat.reshape(H, W, 3)
+
+    elif normals.shape[0] == 3:
+         # (3, H, W) case
+        _, H, W = normals.shape
+        n_flat = normals.reshape(3, -1)
+        rotated = (R @ n_flat).reshape(3, H, W)
+        return rotated
+    else:
+        raise ValueError(f"Expected last or first dim to be 3, got {normals.shape}")
 
 
 def reorient_surface_normals_from_camview(
@@ -87,14 +92,62 @@ def reorient_surface_normals_from_camview(
 
 
 def load_exr(path):
-    assert Path(path).exists() and Path(path).suffix == ".exr", path
-    return cv2.imread(str(path), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+    path = str(path)
+    if not (Path(path).exists() and Path(path).suffix == ".exr"):
+        raise ValueError(f"Invalid EXR path: {path}")
 
+    # Robust loading using OpenEXR if possible
+    try:
+        import OpenEXR
+        import Imath
+        exr_file = OpenEXR.InputFile(path)
+        header = exr_file.header()
+        dw = header['dataWindow']
+        width = dw.max.x - dw.min.x + 1
+        height = dw.max.y - dw.min.y + 1
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        
+        channels = list(header['channels'].keys())
 
-load_flow = load_exr
+        # Decide which channels to read (Normal maps are often XYZ, Colors RGB)
+        # We want to emulate OpenCV's BGR return format if possible for consistency.
+        # Blender 5.0 multilayer EXR uses dotted layer names like "Normal.X" /
+        # "ViewLayer.Normal.X" / "Image.R" etc., so we also try a suffix match.
+        def _find_channels(suffix_groups):
+            """Return channel names matching the requested suffix list, or None."""
+            for suffixes in suffix_groups:
+                matched = []
+                for s in suffixes:
+                    found = next((c for c in channels if c == s or c.endswith("." + s)), None)
+                    if found is None:
+                        matched = None
+                        break
+                    matched.append(found)
+                if matched is not None:
+                    return matched
+            return None
+
+        # Try RGB first (returned as BGR), then XYZ (returned as ZYX), with
+        # multilayer-aware suffix matching for both.
+        C = _find_channels([
+            ['B', 'G', 'R'],
+            ['Z', 'Y', 'X'],
+        ])
+        if C is None:
+            # Fallback to OpenCV standard (may fail on multilayer EXR)
+            return cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+
+        arrs = [np.frombuffer(exr_file.channel(c, pt), dtype=np.float32).reshape(height, width) for c in C]
+        return np.dstack(arrs)
+
+    except Exception as e:
+        logger.warning(f"OpenEXR direct load failed ({e}), falling back to OpenCV for {path}")
+        return cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
 
 
 def load_single_channel(p):
+    import OpenEXR
+    import Imath
     file = OpenEXR.InputFile(str(p))
     channel, channel_type = next(iter(file.header()["channels"].items()))
     match str(channel_type.type):
@@ -113,6 +166,13 @@ def load_depth(p):
 
 
 def load_normals(p):
+    # Depending on how load_exr reads channels, this reordering is important
+    # If load_exr returns BGR (Z, Y, X), then:
+    # 2 -> X
+    # 0 -> Z
+    # 1 -> Y
+    # load_exr(p)[..., [2, 0, 1]] -> [X, Z, Y]
+    # * [-1, 1, 1] -> [-X, Z, Y]
     return load_exr(p)[..., [2, 0, 1]] * np.array([-1.0, 1.0, 1.0])
 
 

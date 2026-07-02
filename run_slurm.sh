@@ -4,17 +4,28 @@
 #SBATCH --array=1-10000
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --mem-per-cpu=4G
-#SBATCH --time=4:00:00
-#SBATCH --tmp=208000
+#SBATCH --mem-per-cpu=8G
+#SBATCH --time=50:00:00
+#SBATCH --tmp=408000
 #SBATCH -o logs/%A_%a.out
-#SBATCH --gpus=rtx_4090:1
+#SBATCH --gpus=pro_6000:1
+# alternative gpu: rtx_4090
 
-# Default to outdoor if SCENE_TYPE is not provided
+# ---------------------------------------------------------------------------
+# Single entry point for BOTH generators, selected by one variable SCENE_TYPE:
+#   outdoor | indoor | multiview | harvest  -> native infinigen  (bpy 4.2,   env "infinigen")
+#   urban                                    -> iCity .blend      (bpy 5.0.1, env "infinigen_city")
+# iCity blends are Blender-5.0 files, so they need the bpy-5.0.1 env; the rest
+# of infinigen runs on bpy 4.2. The correct conda env is activated automatically.
+# ---------------------------------------------------------------------------
 SCENE_TYPE=${SCENE_TYPE:-outdoor}
 
 source  ~/miniconda3/etc/profile.d/conda.sh
-conda activate infinigen
+if [ "$SCENE_TYPE" == "urban" ]; then
+    conda activate infinigen_city
+else
+    conda activate infinigen
+fi
 
 echo "$(date) start ${SLURM_JOB_ID} - Mode: ${SCENE_TYPE}"
 
@@ -124,26 +135,43 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
     # scene.blend) is no longer needed.
     rm -rf "$scene_dir"
 
+elif [ "$SCENE_TYPE" == "urban" ]; then
+    # iCity city panoramas: render from a pre-made iCity .blend in models/city<N>.
+    # process_custom_blend.py registers the iCity addon, remaps libraries, forces
+    # daytime / dry city, places 500 validated panorama cameras and renders them.
+    city_dir="models/city${SLURM_ARRAY_TASK_ID}"
+    echo "Running Urban (iCity) Generation for ${city_dir}..."
+    if [ ! -d "$city_dir" ]; then
+        echo "Error: ${city_dir} does not exist, skipping."
+        exit 1
+    fi
+    python process_custom_blend.py --city_dir "$city_dir" \
+        -g local_256GB.gin monocular.gin blender_gt.gin \
+        -p "camera.spawn_camera_rigs.n_camera_rigs=500" \
+           "camera.compute_base_views.max_tries=100000" \
+           "camera.spawn_camera_rigs.camera_rig_config=[{'loc':(0,0,0),'rot_euler':(0,0,0)}]" \
+        --seed 0
+
 else
-    echo "Error: Unknown SCENE_TYPE '$SCENE_TYPE'. Use 'indoor', 'outdoor', 'multiview', or 'harvest'."
+    echo "Error: Unknown SCENE_TYPE '$SCENE_TYPE'. Use outdoor | indoor | multiview | harvest | urban."
     exit 1
 fi
 
----
-
-# Cleanup logic (now uses the dynamic $base_output)
-echo "Cleaning up $base_output..."
-find "$base_output" -type f -name "*.exr" -delete
-find "$base_output" -type d \( -name "coarse" -o -name "fine" -o -name "Objects" -o -name "UniqueInstances" -o -name "imu_tum" -o -name "logs" -o -name "tmp" -o -name "frames_2_0_0048_0" -o -name "frames_1_0_0048_0" \) -exec rm -rf {} +
+# Cleanup (urban handles its own cleanup inside process_custom_blend.py).
+if [ "$SCENE_TYPE" != "urban" ]; then
+    echo "Cleaning up $base_output..."
+    find "$base_output" -type f -name "*.exr" -delete
+    find "$base_output" -type d \( -name "coarse" -o -name "fine" -o -name "Objects" -o -name "UniqueInstances" -o -name "imu_tum" -o -name "logs" -o -name "tmp" -o -name "frames_2_0_0048_0" -o -name "frames_1_0_0048_0" \) -exec rm -rf {} +
+fi
 
 echo "$(date) finished ${SLURM_JOB_ID}"
 
 
-# Usage
-# sbatch --export=ALL,SCENE_TYPE=type run_slurm.sh
-# Multi-view outdoor (8 panoramas/scene, 1 m baseline):
-#   sbatch --export=ALL,SCENE_TYPE=multiview,N_VIEWS=8 run_slurm.sh
-# Multi-view indoor (0.3 m baseline):
-#   sbatch --export=ALL,SCENE_TYPE=multiview,MV_DOMAIN=indoor,N_VIEWS=8 run_slurm.sh
-# Harvest (array; each task = 1 generated scene -> RIGS_PER_SCENE multi-view sets):
-#   sbatch --array=1-500 --export=ALL,SCENE_TYPE=harvest,RIGS_PER_SCENE=4,N_VIEWS=8 run_slurm.sh
+# Usage (single variable SCENE_TYPE selects the generator + env):
+#   Native infinigen (bpy 4.2, env "infinigen"):
+#     sbatch --export=ALL,SCENE_TYPE=outdoor run_slurm.sh
+#     sbatch --export=ALL,SCENE_TYPE=indoor  run_slurm.sh
+#     sbatch --array=1-500 --export=ALL,SCENE_TYPE=multiview,N_VIEWS=8 run_slurm.sh
+#     sbatch --array=1-500 --export=ALL,SCENE_TYPE=harvest,RIGS_PER_SCENE=4,N_VIEWS=8 run_slurm.sh
+#   iCity urban (bpy 5.0.1, env "infinigen_city"; one array index per models/city<N>):
+#     sbatch --array=1-50 --export=ALL,SCENE_TYPE=urban run_slurm.sh

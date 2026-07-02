@@ -27,7 +27,6 @@ from infinigen.core.rendering.post_render import (
     colorize_int_array,
     colorize_normals,
     load_depth,
-    load_flow,
     load_normals,
     reorient_surface_normals_from_camview,
     load_seg_mask,
@@ -154,7 +153,12 @@ def compositor_postprocessing(
         )
 
     if show:
-        nw.new_node(Nodes.Composite, input_kwargs={"Image": source})
+        # CompositorNodeComposite was removed in Blender 5.0 (compositor is now a node
+        # group; file-output nodes drive the render). Skip it when unavailable.
+        try:
+            nw.new_node(Nodes.Composite, input_kwargs={"Image": source})
+        except (RuntimeError, StopIteration):
+            pass
 
     return source.outputs[0] if hasattr(source, "outputs") else source
 
@@ -168,6 +172,14 @@ def configure_compositor_output(
     passes_to_save,
     saving_ground_truth,
 ):
+    _blender5 = hasattr(bpy.context.scene, "compositing_node_group")
+    if _blender5:
+        return _configure_compositor_output_blender5(
+            nw, frames_folder, image_denoised, image_noisy,
+            passes_to_save, saving_ground_truth,
+        )
+
+    # ---- Blender < 5.0 (legacy code path) ----
     file_output_node_png = nw.new_node(
         Nodes.OutputFile,
         attrs={
@@ -195,13 +207,11 @@ def configure_compositor_output(
             setattr(viewlayer, f"use_pass_{viewlayer_pass}", True)
         else:
             setattr(viewlayer.cycles, f"use_pass_{viewlayer_pass}", True)
-        # must save the material pass index as EXR
         file_output_node = (
             default_file_output_node
             if viewlayer_pass != "material_index"
             else file_output_node_exr
         )
-
         slot_input = file_output_node.file_slots.new(socket_name)
         render_socket = render_layers.outputs[socket_name]
         match viewlayer_pass:
@@ -213,12 +223,37 @@ def configure_compositor_output(
                 )
                 nw.links.new(comnbine_color.outputs[0], slot_input)
             case "normal":
-                color = nw.new_node(
-                    Nodes.CompositorMixRGB,
-                    [None, render_socket, (0, 0, 0, 0)],
-                    attrs={"blend_type": "ADD"},
-                ).outputs[0]
-                nw.links.new(color, slot_input)
+                if default_file_output_node.name == file_output_node_png.name:
+                    add_one = nw.new_node(
+                        Nodes.CompositorMixRGB,
+                        [None, render_socket, (1, 1, 1, 1)],
+                        attrs={"blend_type": "ADD"},
+                    ).outputs[0]
+                    color = nw.new_node(
+                        Nodes.CompositorMixRGB,
+                        [None, add_one, (0.5, 0.5, 0.5, 1)],
+                        attrs={"blend_type": "MULTIPLY"},
+                    ).outputs[0]
+                    set_alpha = nw.new_node("CompositorNodeSetAlpha")
+                    nw.links.new(color, set_alpha.inputs[0])
+                    set_alpha.inputs[1].default_value = 1.0
+                    nw.links.new(set_alpha.outputs[0], slot_input)
+                    exr_socket = file_output_node_exr.file_slots.new(socket_name)
+                    nw.links.new(render_socket, exr_socket)
+                    file_slot_list.append(file_output_node_exr.file_slots[exr_socket.name])
+                else:
+                    color = nw.new_node(
+                        Nodes.CompositorMixRGB,
+                        [None, render_socket, (0, 0, 0, 0)],
+                        attrs={"blend_type": "ADD"},
+                    ).outputs[0]
+                    nw.links.new(color, slot_input)
+            case "z":
+                nw.links.new(render_socket, slot_input)
+                if default_file_output_node.name == file_output_node_png.name:
+                    exr_socket = file_output_node_exr.file_slots.new(socket_name)
+                    nw.links.new(render_socket, exr_socket)
+                    file_slot_list.append(file_output_node_exr.file_slots[exr_socket.name])
             case _:
                 nw.links.new(render_socket, slot_input)
         file_slot_list.append(file_output_node.file_slots[slot_input.name])
@@ -231,6 +266,64 @@ def configure_compositor_output(
     # else (beauty render): the RGB beauty pass is saved as PNG only; we no
     # longer also write a redundant OPEN_EXR copy of it.
     file_slot_list.append(default_file_output_node.file_slots[slot_input.path])
+    return file_slot_list
+
+
+# Maps render-pass socket names to the socket_type enum required by
+# NodeCompositorFileOutputItems.new(socket_type, name) in Blender 5.0.
+_BLENDER5_PASS_SOCKET_TYPE = {
+    "Image":       "RGBA",
+    "Noisy Image": "RGBA",
+    "Depth":       "FLOAT",
+    "Normal":      "VECTOR",
+    "Vector":      "VECTOR",
+}
+
+
+def _configure_compositor_output_blender5(
+    nw, frames_folder, image_denoised, image_noisy, passes_to_save, saving_ground_truth,
+):
+    """
+    Blender 5.0 compositor output:
+
+      - CompositorNodeOutputFile is a node group with `directory` + `file_name`.
+      - Each node saves ONE multilayer EXR file (`<file_name>####.exr`).
+      - file_output_items are LAYERS in that one file.
+      - To get separate files per pass we use ONE node per pass.
+      - The node-level format is locked to OPEN_EXR_MULTILAYER; PNG output
+        from the compositor is not supported in this version, so all data
+        is saved as EXR (post-processing converts to PNG/.npy as needed).
+    """
+    file_slot_list = []
+    viewlayer = bpy.context.scene.view_layers["ViewLayer"]
+    render_layers = nw.new_node(Nodes.RenderLayers)
+
+    def _make_pass_node(name, socket_type):
+        """Create a File Output node dedicated to a single pass."""
+        node = nw.new_node(Nodes.OutputFile, attrs={"directory": str(frames_folder)})
+        node.file_name = name
+        # Fresh node has no items by default; add one of the right type.
+        node.file_output_items.new(socket_type, name)
+        return node
+
+    for viewlayer_pass, socket_name in passes_to_save:
+        if hasattr(viewlayer, f"use_pass_{viewlayer_pass}"):
+            setattr(viewlayer, f"use_pass_{viewlayer_pass}", True)
+        else:
+            setattr(viewlayer.cycles, f"use_pass_{viewlayer_pass}", True)
+
+        socket_type = _BLENDER5_PASS_SOCKET_TYPE.get(socket_name, "RGBA")
+        pass_node = _make_pass_node(socket_name, socket_type)
+        render_socket = render_layers.outputs[socket_name]
+        nw.links.new(render_socket, pass_node.inputs[socket_name])
+        file_slot_list.append(pass_node)
+
+    # Beauty image (RGB) — also saved as EXR in Blender 5.0
+    image = image_denoised if image_denoised is not None else image_noisy
+    image_name = "UniqueInstances" if saving_ground_truth else "Image"
+    image_node = _make_pass_node(image_name, "RGBA")
+    nw.links.new(image, image_node.inputs[image_name])
+    file_slot_list.append(image_node)
 
     # If nothing actually feeds the EXR output node (beauty render with no
     # EXR-only passes such as material_index), mute it so Blender does not emit
@@ -391,7 +484,23 @@ def configure_compositor(
     passes_to_save: list,
     flat_shading: bool,
 ):
-    compositor_node_tree = bpy.context.scene.node_tree
+    # Blender 5.0+ uses scene.compositing_node_group (a standalone CompositorNodeTree
+    # in bpy.data.node_groups); older Blender used scene.use_nodes + scene.node_tree.
+    scene = bpy.context.scene
+    if hasattr(scene, "compositing_node_group"):
+        # Blender 5.0+
+        if scene.compositing_node_group is None:
+            scene.compositing_node_group = bpy.data.node_groups.new(
+                "Compositor", "CompositorNodeTree"
+            )
+        compositor_node_tree = scene.compositing_node_group
+    else:
+        # Blender < 5.0
+        scene.use_nodes = True
+        compositor_node_tree = scene.node_tree
+    # Clear old compositor nodes to prevent accumulation across renders
+    compositor_node_tree.nodes.clear()
+
     nw = NodeWrangler(compositor_node_tree)
 
     render_layers = nw.new_node(Nodes.RenderLayers)
@@ -480,16 +589,20 @@ def render_image(
                 )
                 (frames_folder / f"Materials{suffix}.json").write_text(json_object)
 
-    if not bpy.context.scene.use_nodes:
+    # use_nodes guard only needed for Blender < 5.0; configure_compositor handles both versions
+    if hasattr(bpy.context.scene, "use_nodes") and not bpy.context.scene.use_nodes:
         bpy.context.scene.use_nodes = True
     file_slot_nodes = configure_compositor(frames_folder, passes_to_save, flat_shading)
 
     indices = dict(cam_rig=camrig_id, resample=0, subcam=subcam_id)
 
-    ## Update output names
+    ## Update output names (Blender 5.0: file_output_items use .file_name; older: .path)
     fileslot_suffix = get_suffix({"frame": "####", **indices})
     for file_slot in file_slot_nodes:
-        file_slot.path = f"{file_slot.path}{fileslot_suffix}"
+        if hasattr(file_slot, "file_name"):        # Blender 5.0
+            file_slot.file_name = f"{file_slot.file_name}{fileslot_suffix}"
+        elif hasattr(file_slot, "path"):           # Blender < 5.0
+            file_slot.path = f"{file_slot.path}{fileslot_suffix}"
 
     if use_dof == "IF_TARGET_SET":
         use_dof = camera.data.dof.focus_object is not None
