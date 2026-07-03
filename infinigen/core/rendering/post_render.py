@@ -218,6 +218,31 @@ def colorize_depth(depth, scale_vmin=1.0):
     return np.ascontiguousarray(depth[..., :3] * 255, dtype=np.uint8)
 
 
+def colorize_depth_viz(depth, lo_pct=2, hi_pct=98, cmap_name="Spectral", invalid=(0, 0, 0)):
+    """Colorize LINEAR metric depth for viewing, Depth-Anything style:
+    NEAR = warm (red), FAR = cool (blue), log-scaled between robust percentiles
+    so near detail stays visible. Sky / invalid pixels are set to `invalid`.
+
+    This replaces the older colorize_depth() for the saved Depth PNGs: that one
+    uses a jet map (near=blue/far=red) and, when handed log-depth, flags near
+    pixels invalid and paints them white.
+    """
+    depth = np.asarray(depth, dtype=np.float32)
+    valid = np.isfinite(depth) & (depth > 1e-3) & (depth < 1e5)
+    out = np.empty((*depth.shape, 3), dtype=np.uint8)
+    out[...] = np.asarray(invalid, dtype=np.uint8)
+    if not valid.any():
+        return out
+    dv = depth[valid]
+    lo = max(float(np.percentile(dv, lo_pct)), 1e-3)
+    hi = max(float(np.percentile(dv, hi_pct)), lo * 1.001)
+    t = (np.log(np.clip(depth, lo, hi)) - np.log(lo)) / (np.log(hi) - np.log(lo))
+    # Spectral: t=0 (near) -> red, t=1 (far) -> blue
+    rgb = plt.get_cmap(cmap_name)(t)[..., :3]
+    out[valid] = (rgb[valid] * 255 + 0.5).astype(np.uint8)
+    return out
+
+
 def colorize_int_array(data, color_seed=0):
     H, W, *_ = data.shape
     data = data.reshape((H * W, -1))

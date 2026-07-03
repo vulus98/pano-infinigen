@@ -73,7 +73,7 @@ from infinigen.core.rendering import render
 from infinigen.core.util import blender as butil
 
 # Specific post-processing tools requested by user
-from infinigen.core.rendering.post_render import load_normals, reorient_surface_normals_from_camview, colorize_normals, load_depth, colorize_depth, load_exr
+from infinigen.core.rendering.post_render import load_normals, reorient_surface_normals_from_camview, colorize_normals, load_depth, colorize_depth, colorize_depth_viz, load_exr
 from infinigen.tools.suffixes import get_suffix
 
 def _register_icity_addon():
@@ -661,9 +661,8 @@ def main(args):
 
                     # Save log-depth visualization PNG with spectral colormap
                     import matplotlib.cm as cm
-                    log_depth = np.log(np.clip(depth_clamped, 1e-6, None))
-                    log_depth = (log_depth - log_depth.min()) / (log_depth.max() - log_depth.min() + 1e-8)
-                    depth_colored = (cm.Spectral(1.0 - log_depth)[..., :3] * 255).astype(np.uint8)
+                    # near=red / far=blue, log-scaled, no white near-field artifacts.
+                    depth_colored = colorize_depth_viz(depth_clamped)
                     imageio.imwrite(depth_path.with_name(f"Depth{suffix}.png"), depth_colored)
 
                     # Clean up: Delete original EXR

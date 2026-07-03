@@ -23,6 +23,7 @@ from infinigen.core.nodes.node_wrangler import Nodes, NodeWrangler
 from infinigen.core.placement import camera as cam_util
 from infinigen.core.rendering.post_render import (
     colorize_depth,
+    colorize_depth_viz,
     colorize_flow,
     colorize_int_array,
     colorize_normals,
@@ -424,11 +425,12 @@ def postprocess_blendergt_outputs(frames_folder, output_stem, camview_T=None):
     #     depth_dst_path.with_name(f"Depth{output_stem}_raw.png"), colorize_depth(depth_array_reduced)
     # )
     depth_array_clipped = np.clip(depth_array_reduced, 1e-6, 75)
-    
+
     np.save(flow_dst_path.with_name(f"Depth{output_stem}.npy"), depth_array_clipped)
-    depth_array_log = np.log(depth_array_clipped)
+    # near=red / far=blue, log-scaled, no white near-field artifacts.
     imwrite(
-        depth_dst_path.with_name(f"Depth{output_stem}.png"), colorize_depth(depth_array_log)
+        depth_dst_path.with_name(f"Depth{output_stem}.png"),
+        colorize_depth_viz(depth_array_clipped),
     )
     depth_dst_path.unlink()
 
