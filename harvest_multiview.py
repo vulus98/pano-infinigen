@@ -58,6 +58,9 @@ from infinigen.core.util import blender as butil
 def build_instance_aware_bvh(exclude_prefix=("camera", "camrig", "Camera")):
     """World-space BVHTree including geometry-node / collection instances, built
     from the evaluated depsgraph so it matches the rendered geometry."""
+    # Force full evaluation first so no geometry-node geometry is missing from the
+    # depsgraph (a partial BVH would let enclosed poses pass validation).
+    bpy.context.view_layer.update()
     deps = bpy.context.evaluated_depsgraph_get()
     cache = {}
 

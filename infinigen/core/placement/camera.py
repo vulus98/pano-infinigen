@@ -705,6 +705,12 @@ def build_instance_aware_bvh(exclude_prefix="Culling"):
     import bmesh as _bmesh
     import time as _time
 
+    # Force a full depsgraph evaluation first. After loading / library-reloading a
+    # scene (esp. iCity), geometry-node modifiers may not be evaluated yet, so a
+    # bare evaluated_depsgraph_get() can return a PARTIAL scene -> the BVH would
+    # miss buildings and enclosed camera poses would wrongly pass the pre-render
+    # check (while the render, which fully evaluates, shows them enclosed).
+    bpy.context.view_layer.update()
     depsgraph = bpy.context.evaluated_depsgraph_get()
 
     # Cache local (untransformed) triangulated geometry per evaluated mesh so the
