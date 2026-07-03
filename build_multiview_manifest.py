@@ -60,6 +60,28 @@ def _find_channel_file(frames: Path, channel: str, subcam: int, suffix: str):
     return None
 
 
+def _anchor_near_frac(frames: Path, anchor_frame, near_dist=8.0, band=0.09):
+    """Fraction of the anchor equirect-depth's HORIZONTAL band (`band` of the
+    rows, centred on the equator) that lies within `near_dist` m -- a proxy for
+    how much parallax-giving near content the view has. None if unavailable."""
+    if anchor_frame is None or not anchor_frame.get("depth_path"):
+        return None
+    p = frames / anchor_frame["depth_path"]
+    if p.suffix != ".npy" or not p.exists():
+        return None
+    try:
+        d = np.load(p).astype(np.float32)
+    except Exception:
+        return None
+    H = d.shape[0]
+    lo, hi = int(H * (0.5 - band / 2)), int(H * (0.5 + band / 2))
+    strip = d[lo:hi]
+    valid = np.isfinite(strip) & (strip > 1e-3) & (strip < 1e4)
+    if not valid.any():
+        return None
+    return round(float(np.mean(valid & (strip < near_dist))), 4)
+
+
 def build_scene_manifests(scene_dir: Path) -> list[Path]:
     """Build one transforms_camrig_<r>.json per camera rig in this scene.
     Returns the list of manifest paths written."""
@@ -103,10 +125,8 @@ def build_scene_manifests(scene_dir: Path) -> list[Path]:
         rig["frames"].sort(key=lambda e: (e["frame"], e["subcam"]))
         # Effective baseline for this scene = median anchor->neighbour distance.
         # Recorded so baseline-diverse datasets can be filtered / weighted by it.
-        anchor = next(
-            (np.array(f["transform_matrix"]) for f in rig["frames"] if f["is_anchor"]),
-            None,
-        )
+        anchor_frame = next((f for f in rig["frames"] if f["is_anchor"]), None)
+        anchor = np.array(anchor_frame["transform_matrix"]) if anchor_frame else None
         dists = (
             [
                 float(np.linalg.norm(np.array(f["transform_matrix"])[:3, 3] - anchor[:3, 3]))
@@ -128,6 +148,9 @@ def build_scene_manifests(scene_dir: Path) -> list[Path]:
             "w": rig["w"],
             "h": rig["h"],
             "baseline_m": round(float(np.median(dists)), 4) if dists else 0.0,
+            # Parallax proxy: fraction of the anchor's horizontal band within ~8 m.
+            # Low -> a distant/empty view (little parallax); filter/weight on it.
+            "near_frac": _anchor_near_frac(frames, anchor_frame),
             "frames": rig["frames"],
         }
         # One rig per scene is the common case -> a single transforms.json. Only

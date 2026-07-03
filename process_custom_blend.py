@@ -668,11 +668,37 @@ def main(args):
                     # Clean up: Delete original EXR
                     depth_path.unlink()
 
-                    # NOTE: the old post-render clipping check (reject if
-                    # max_depth<2m / clip_frac>5% / sky_frac<10%) has been removed.
-                    # It is now redundant: configure_cameras runs the same test
-                    # PRE-render via panoramic_depth_stats against the instance-aware
-                    # BVH, so enclosed / prop-clipping poses never reach the renderer.
+                    # Post-render enclosure check (SAFETY NET). The pre-render
+                    # panoramic check uses the instance-aware BVH, which can miss
+                    # some iCity building geometry, so a camera can still end up
+                    # inside a building (dark, no open sky). Re-validate on the
+                    # ACTUAL rendered depth (ground truth) and drop such cameras:
+                    #   - max_depth < 2m            -> fully enclosed
+                    #   - >5% of pixels < 0.5m      -> clipping through a prop
+                    #   - <12% sky AND <12% far     -> inside a building / courtyard
+                    max_depth = float(np.max(depth_raw))
+                    clip_frac = float(np.mean(depth_raw < 0.5))
+                    sky_frac = float(np.mean(depth_raw > 1e4))
+                    far_frac = float(np.mean(depth_raw > 30.0))
+                    reject_reason = None
+                    if max_depth < 2.0:
+                        reject_reason = f"max_depth={max_depth:.1f}m (enclosed)"
+                    elif clip_frac > 0.05:
+                        reject_reason = f"clip_frac={clip_frac:.2%} (inside prop)"
+                    elif sky_frac < 0.12 and far_frac < 0.12:
+                        reject_reason = (
+                            f"sky_frac={sky_frac:.2%} far_frac={far_frac:.2%} "
+                            "(inside building)"
+                        )
+                    if reject_reason:
+                        print(f"Rejecting camera {suffix}: {reject_reason}")
+                        for channel_dir in frames_folder.iterdir():
+                            if not channel_dir.is_dir():
+                                continue
+                            for f in channel_dir.rglob(f"*{suffix}.*"):
+                                f.unlink()
+                        continue
+
                     print(f"Processed depth and deleted {depth_path}")
                 except Exception as e:
                     print(f"Error processing depth {depth_path}: {e}")

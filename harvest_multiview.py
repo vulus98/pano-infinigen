@@ -110,22 +110,37 @@ def build_instance_aware_bvh(exclude_prefix=("camera", "camrig", "Camera")):
     return BVHTree.FromPolygons(allv.tolist(), faces, all_triangles=True), allv
 
 
-def panoramic_sky_frac(origin, bvh, n_theta=24, n_phi=48, sky_dist=1e4):
-    """Fraction of a lat/long sphere of rays from `origin` that see open sky
-    (miss all geometry). Matches the equirectangular pixel distribution."""
+def panoramic_stats(origin, bvh, near_dist=8.0, horiz_deg=8.0,
+                    n_theta=24, n_phi=48, sky_dist=1e4):
+    """Over a lat/long sphere of rays from `origin`, return
+    ``(sky_frac, near_frac)``:
+      - sky_frac: fraction of ALL rays that miss geometry (open sky).
+      - near_frac: fraction of the HORIZONTAL band (within `horiz_deg` of the
+        equator) that hits geometry within `near_dist` m. Only the horizontal
+        band is used because that's where nearby objects (trees, walls,
+        buildings) live -- the ground straight down is always 'near' but gives
+        no parallax, and the sky straight up is empty.
+    """
     origin = Vector(origin)
     thetas = np.pi * (np.arange(n_theta) + 0.5) / n_theta
     phis = 2 * np.pi * (np.arange(n_phi) + 0.5) / n_phi
     miss = 0
+    near = 0
+    horiz = 0
     for th in thetas:
         st, ct = np.sin(th), np.cos(th)
+        is_horiz = abs(np.degrees(th) - 90.0) <= horiz_deg
         for ph in phis:
             _, _, _, d = bvh.ray_cast(
                 origin, Vector((st * np.cos(ph), st * np.sin(ph), ct))
             )
             if d is None or d > sky_dist:
                 miss += 1
-    return miss / (n_theta * n_phi)
+            if is_horiz:
+                horiz += 1
+                if d is not None and d <= sky_dist and d < near_dist:
+                    near += 1
+    return miss / (n_theta * n_phi), (near / horiz if horiz else 0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -148,11 +163,16 @@ def sampling_bounds(all_verts, gen_cam_locs, radius, central):
     return (float(x0), float(x1), float(y0), float(y1), float(lo[2]), float(hi[2]))
 
 
-def find_and_place_anchor(rig, cams, bvh, bounds, altitude, min_clear, min_sky, tries):
+def find_and_place_anchor(rig, cams, bvh, bounds, altitude, min_clear, min_sky,
+                          min_near, near_dist, tries):
     """Move `rig` (and its sub-cameras `cams`) to a valid anchor. Returns True on
-    success. A pose is valid when every sub-camera is >= min_clear m from any
-    surface (not underground / not inside a prop) and the anchor sees >= min_sky
-    open sky."""
+    success. A pose is valid when:
+      - every sub-camera is >= min_clear m from any surface (not underground /
+        not inside a prop),
+      - the anchor sees >= min_sky open sky, AND
+      - >= min_near of the horizontal band has content within near_dist m, so the
+        panorama has close objects that actually produce parallax (rejects empty
+        desert/ocean-horizon poses)."""
     x0, x1, y0, y1, zlo, zhi = bounds
     for _ in range(tries):
         x, y = np.random.uniform(x0, x1), np.random.uniform(y0, y1)
@@ -172,7 +192,8 @@ def find_and_place_anchor(rig, cams, bvh, bounds, altitude, min_clear, min_sky, 
                 break
         if not clear:
             continue
-        if panoramic_sky_frac(cams[0].matrix_world.translation, bvh) < min_sky:
+        sky, near = panoramic_stats(cams[0].matrix_world.translation, bvh, near_dist)
+        if sky < min_sky or near < min_near:
             continue
         return True
     return False
@@ -262,7 +283,8 @@ def harvest_scene(blend_path, out_root, args):
         rig, cams = spawn_rig(k, cfg)
         if find_and_place_anchor(
             rig, cams, bvh, bounds, args.altitude,
-            args.min_clearance, args.min_sky, args.place_tries,
+            args.min_clearance, args.min_sky, args.min_near, args.near_dist,
+            args.place_tries,
         ):
             b = np.linalg.norm(cams[1].matrix_world.translation - cams[0].matrix_world.translation)
             logger.info(f"  rig {k}: placed (baseline~{b:.2f} m)")
@@ -326,6 +348,11 @@ def main():
                     help="fallback: central XY fraction if the scene had no cameras")
     ap.add_argument("--min-clearance", type=float, default=0.3, help="min metres from any surface per sub-camera")
     ap.add_argument("--min-sky", type=float, default=0.1, help="min open-sky fraction at the anchor")
+    ap.add_argument("--min-near", type=float, default=0.2,
+                    help="min fraction of the horizontal band with content within "
+                    "--near-dist (rejects empty/no-parallax poses; 0 to disable)")
+    ap.add_argument("--near-dist", type=float, default=8.0,
+                    help="metres: content closer than this counts as parallax-giving")
     ap.add_argument("--place-tries", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
