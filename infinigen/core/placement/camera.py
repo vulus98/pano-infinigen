@@ -650,7 +650,7 @@ def compute_base_views(
             # rays against the (instance-aware) BVH and apply the SAME thresholds
             # the post-render depth check used, making that check redundant.
             if panoramic_enclosure_check:
-                max_depth, clip_frac, sky_frac = panoramic_depth_stats(
+                max_depth, clip_frac, sky_frac, far_frac = panoramic_depth_stats(
                     cam.matrix_world.translation, scene_bvh
                 )
                 if max_depth < 2.0:
@@ -659,8 +659,11 @@ def compute_base_views(
                 if clip_frac > 0.05:
                     rejection_counts["pano_clip"] += 1
                     continue
-                if sky_frac < 0.10:
-                    rejection_counts["pano_low_sky"] += 1
+                # Inside a building: almost no open sky AND almost no distant view.
+                # (Requiring both low keeps valid narrow streets, which see little
+                # sky but plenty of far geometry down the street.)
+                if sky_frac < 0.12 and far_frac < 0.12:
+                    rejection_counts["pano_inside_building"] += 1
                     continue
 
             # Compute focus distance
@@ -774,16 +777,22 @@ def build_instance_aware_bvh(exclude_prefix="Culling"):
     return BVHTree.FromPolygons(verts.tolist(), all_faces, all_triangles=True)
 
 
-def panoramic_depth_stats(origin, scene_bvh, n_theta=48, n_phi=96, sky_dist=1e4):
+def panoramic_depth_stats(origin, scene_bvh, n_theta=128, n_phi=256, sky_dist=1e4,
+                          far_dist=30.0):
     """Raycast a full equirectangular sphere of directions from ``origin`` against
-    ``scene_bvh`` and return ``(max_depth, clip_frac, sky_frac)`` with the exact
-    definitions the post-render depth check uses.
+    ``scene_bvh`` and return ``(max_depth, clip_frac, sky_frac, far_frac)``.
 
     Directions are sampled on a lat/long grid, matching how equirectangular pixels
     tile the sphere (denser toward the poles), so the returned fractions equal the
     fractions the rendered depth map would report. Because the statistics are over
     the whole sphere, they are independent of camera yaw. A missed ray (open sky)
     counts as ``sky_dist * 10`` so it registers as sky and as a large max depth.
+
+    The grid is fairly dense (128x256): a coarse grid can thread rays through the
+    small gaps in an iCity building shell and read a fully-enclosed courtyard as
+    partly open. ``far_frac`` (fraction seeing beyond ``far_dist`` m) is returned
+    alongside ``sky_frac`` because an inside-building view can have ~0 open sky yet
+    a sliver of distant street; requiring BOTH to be low is a robust enclosure test.
     """
     origin = Vector(origin)
     thetas = np.pi * (np.arange(n_theta) + 0.5) / n_theta
@@ -801,6 +810,7 @@ def panoramic_depth_stats(origin, scene_bvh, n_theta=48, n_phi=96, sky_dist=1e4)
         float(depths.max()),
         float((depths < 0.5).mean()),
         float((depths > sky_dist).mean()),
+        float((depths > far_dist).mean()),
     )
 
 
