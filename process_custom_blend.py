@@ -349,6 +349,14 @@ def _force_wetness_off():
             pass
 
 
+def _parse_spec(s):
+    """Parse '0.5' -> 0.5 or 'uniform,0.3,0.7' -> ('uniform', 0.3, 0.7)."""
+    parts = str(s).split(",")
+    if len(parts) == 1:
+        return float(parts[0])
+    return (parts[0], *[float(p) for p in parts[1:]])
+
+
 def main(args):
     # 1. Resolve city directory and discover files
     city_dir = args.city_dir.resolve()
@@ -416,6 +424,15 @@ def main(args):
     gin.bind_parameter("infinigen.core.placement.camera.camera_pose_proposal.yaw", ("uniform", -180, 180))
     # Altitude: 1-3m above ground
     gin.bind_parameter("infinigen.core.placement.camera.camera_pose_proposal.altitude", ("uniform", 2, 4))
+    # Multi-view: require near, parallax-giving content in the horizontal band so a
+    # small-baseline rig isn't placed in an open plaza / wide road where it sees no
+    # motion. Off for single panoramas (baseline is moot there).
+    if getattr(args, "n_views", 1) > 1 and args.min_near_frac > 0:
+        gin.bind_parameter(
+            "infinigen.core.placement.camera.compute_base_views.min_pano_near_frac",
+            args.min_near_frac,
+        )
+        print(f"Multi-view: requiring near_frac >= {args.min_near_frac} at each anchor")
 
     # 3. Find floor level (min Z)
     # Only consider objects that are visible in render — hidden objects, culling
@@ -487,8 +504,24 @@ def main(args):
                     worst_obj = obj.name
             print(f"  {axis_names[axis]} {label} = {worst_val:.1f} from '{worst_obj}'")
 
-    # 4. Spawn Camera Rig
-    camera_rigs = cam_util.spawn_camera_rigs()
+    # 4. Spawn Camera Rig(s)
+    # Multi-view (--n-views > 1): each rig is a pitch-compensated constellation of
+    # N sub-cameras (anchor + neighbours), so one placed rig yields N pose-
+    # registered panoramas of the same content. n_views=1 keeps single-camera rigs.
+    n_views = getattr(args, "n_views", 1)
+    if n_views > 1:
+        baseline = _parse_spec(args.baseline)
+        rig_cfg = cam_util.multiview_rig_config(
+            n_views=n_views,
+            baseline=baseline,
+            pattern="ring",
+            z_amplitude=args.z_amplitude,
+            level_pitch_deg=90,  # matches camera_pose_proposal.pitch bound above
+        )
+        print(f"Multi-view: {n_views} sub-cameras/rig, baseline={baseline}")
+        camera_rigs = cam_util.spawn_camera_rigs(camera_rig_config=rig_cfg)
+    else:
+        camera_rigs = cam_util.spawn_camera_rigs()
     if not camera_rigs:
         raise RuntimeError("Failed to spawn camera rigs")
 
@@ -540,7 +573,7 @@ def main(args):
               f"rot_deg=({np.degrees(rot.x):.1f}, {np.degrees(rot.y):.1f}, {np.degrees(rot.z):.1f})")
 
     # Setup Resolution & Clipping
-    render_res = (4096, 2048)
+    render_res = tuple(args.resolution)
     clip_start = 0.001
 
 
@@ -562,7 +595,7 @@ def main(args):
     bpy.context.scene.view_settings.exposure = 0.0
 
     # Setup Resolution & Clipping
-    render_res = (4096, 2048) 
+    render_res = tuple(args.resolution)
     clip_start = 0.001
 
     t0 = _phase("render")
@@ -620,13 +653,17 @@ def main(args):
                     # Reorient to Camera Space using camera matrix
                     camview_T = np.array(cam.matrix_world)
                     normals_cam = reorient_surface_normals_from_camview(normals_world, camview_T)
-                    
-                    # Save Raw .npy
-                    np.save(normal_path.with_name(f"SurfaceNormal{suffix}.npy"), normals_cam.astype(np.float16))
-                    
+
+                    # Save into a SurfaceNormal/ channel dir (matches the datagen
+                    # layout the multi-view manifest expects), not the Normal/ dir
+                    # that only held the raw world-space EXR.
+                    sn_dir = frames_folder / "SurfaceNormal" / f"camera_{subcam_id}"
+                    sn_dir.mkdir(parents=True, exist_ok=True)
+                    np.save(sn_dir / f"SurfaceNormal{suffix}.npy", normals_cam.astype(np.float16))
+
                     # Save Visualization PNG
                     colored = colorize_normals(normals_cam)
-                    imageio.imwrite(normal_path.with_name(f"SurfaceNormal{suffix}.png"), colored)
+                    imageio.imwrite(sn_dir / f"SurfaceNormal{suffix}.png", colored)
                     
                     # Clean up: Delete original EXR
                     normal_path.unlink()
@@ -740,11 +777,22 @@ def main(args):
     for exr in frames_folder.rglob("*.exr"):
         exr.unlink()
     camview_dir = frames_folder / "camview"
-    if camview_dir.exists():
+    # Multi-view needs the per-camera poses to build transforms.json; keep camview
+    # in that case (single-panorama mode has no use for it, so drop it).
+    if camview_dir.exists() and n_views <= 1:
         shutil.rmtree(camview_dir)
     tmp_dir = output_folder / "tmp"
     if tmp_dir.exists() and tmp_dir.is_dir():
         shutil.rmtree(tmp_dir)
+
+    # 8. Multi-view: assemble one transforms.json per rig (anchor + neighbours)
+    # from the saved camview poses, then prune leftover EXR / helper folders.
+    if n_views > 1:
+        t0 = _phase("build manifests")
+        from build_multiview_manifest import build_scene_manifests, prune_scene
+        build_scene_manifests(output_folder)
+        prune_scene(output_folder)
+        _phase_done("build manifests", t0)
 
     _phase_done("render", t0)
 
@@ -761,6 +809,21 @@ if __name__ == "__main__":
     parser.add_argument('--city_dir', required=True, type=Path, help="Path to city directory (e.g. models/city1), containing a .blend file and HDRI .exr")
     parser.add_argument('-g', '--configs', nargs='+', default=[], help="Gin config files")
     parser.add_argument('-p', '--overrides', nargs='+', default=[], help="Gin config overrides")
+    # Multi-view: >1 makes each camera rig a constellation of N sub-cameras (an
+    # anchor + neighbours a short baseline apart), all rendered as 360 panoramas
+    # and written as one pose-registered transforms.json per rig -- the multi-view
+    # supervision a GS head needs. n_views=1 (default) keeps single-panorama rigs.
+    parser.add_argument('--n-views', type=int, default=1,
+                        help="sub-cameras per rig (1 = single panorama; >1 = multi-view set)")
+    parser.add_argument('--baseline', default="0.3",
+                        help="multi-view neighbour distance (m): float or 'uniform,lo,hi'")
+    parser.add_argument('--z-amplitude', type=float, default=0.2,
+                        help="multi-view: +/- vertical parallax for the ring (m)")
+    parser.add_argument('--min-near-frac', type=float, default=0.12,
+                        help="multi-view: reject anchors whose horizontal band has "
+                        "less than this fraction of content within ~8 m (low parallax); 0 to disable")
+    parser.add_argument('--resolution', type=lambda s: tuple(int(x) for x in s.split(",")),
+                        default=(4096, 2048), help="render W,H (default 4096,2048)")
     # Ignored args that manage_jobs might pass
     parser.add_argument('--seed', default=0)
     parser.add_argument('--task', default='')

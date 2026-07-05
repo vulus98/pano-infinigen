@@ -136,20 +136,33 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
     rm -rf "$scene_dir"
 
 elif [ "$SCENE_TYPE" == "urban" ]; then
-    # iCity city panoramas: render from a pre-made iCity .blend in models/city<N>.
+    # iCity multi-view panoramas from a pre-made iCity .blend in models/city<N>.
     # process_custom_blend.py registers the iCity addon, remaps libraries, forces
-    # daytime / dry city, places 500 validated panorama cameras and renders them.
+    # daytime / dry city, then places N_RIGS validated rigs -- each a constellation
+    # of N_VIEWS sub-cameras (anchor + neighbours a short baseline apart) rendered
+    # as 360 panoramas -- and writes one pose-registered transforms.json per rig.
+    # Set N_VIEWS=1 to fall back to single independent panoramas (no manifest).
+    #   Time scales with N_RIGS * N_VIEWS * resolution (full-res ~3.4 min/camera).
+    N_VIEWS=${N_VIEWS:-8}
+    N_RIGS=${N_RIGS:-40}
+    BASELINE=${BASELINE:-uniform,0.3,0.6}
+    RES=${RES:-4096,2048}
     city_dir="models/city${SLURM_ARRAY_TASK_ID}"
-    echo "Running Urban (iCity) Generation for ${city_dir}..."
+    echo "Running Urban (iCity) multi-view Generation for ${city_dir} (N_VIEWS=${N_VIEWS}, N_RIGS=${N_RIGS})..."
     if [ ! -d "$city_dir" ]; then
         echo "Error: ${city_dir} does not exist, skipping."
         exit 1
     fi
+    # n_views=1 needs the single-camera rig config; n_views>1 builds its own
+    # multi-view constellation inside process_custom_blend.py.
+    if [ "$N_VIEWS" -gt 1 ]; then RIG_OVR=""; else
+        RIG_OVR="camera.spawn_camera_rigs.camera_rig_config=[{'loc':(0,0,0),'rot_euler':(0,0,0)}]"; fi
     python process_custom_blend.py --city_dir "$city_dir" \
         -g local_256GB.gin monocular.gin blender_gt.gin \
-        -p "camera.spawn_camera_rigs.n_camera_rigs=500" \
+        -p "camera.spawn_camera_rigs.n_camera_rigs=$N_RIGS" \
            "camera.compute_base_views.max_tries=100000" \
-           "camera.spawn_camera_rigs.camera_rig_config=[{'loc':(0,0,0),'rot_euler':(0,0,0)}]" \
+           $RIG_OVR \
+        --n-views "$N_VIEWS" --baseline "$BASELINE" --resolution "$RES" \
         --seed 0
 
 else
@@ -173,5 +186,5 @@ echo "$(date) finished ${SLURM_JOB_ID}"
 #     sbatch --export=ALL,SCENE_TYPE=indoor  run_slurm.sh
 #     sbatch --array=1-500 --export=ALL,SCENE_TYPE=multiview,N_VIEWS=8 run_slurm.sh
 #     sbatch --array=1-500 --export=ALL,SCENE_TYPE=harvest,RIGS_PER_SCENE=4,N_VIEWS=8 run_slurm.sh
-#   iCity urban (bpy 5.0.1, env "infinigen_city"; one array index per models/city<N>):
-#     sbatch --array=1-50 --export=ALL,SCENE_TYPE=urban run_slurm.sh
+#   iCity urban multi-view (bpy 5.0.1, env "infinigen_city"; one array index per models/city<N>):
+#     sbatch --array=1-50 --export=ALL,SCENE_TYPE=urban,N_VIEWS=8,N_RIGS=40 run_slurm.sh

@@ -542,6 +542,8 @@ def compute_base_views(
     max_tries=30000,
     visualize=False,
     panoramic_enclosure_check=False,
+    min_pano_near_frac=0.0,
+    sky_visibility_check=True,
     **kwargs,
 ):
     import time as _time
@@ -624,25 +626,29 @@ def compute_base_views(
 
             # Sky-visibility check: raycast UPWARD only. Horizontal rays are
             # unreliable — wide buildings have walls 50-100m away, giving false
-            # "open" readings. Ceilings are always close if you're indoors.
-            MAX_CEILING_DIST = 200.0  # no real building taller than this
-            MIN_OPEN_FRAC = 0.3       # at least 30% of upward rays must see sky
-            cam_loc = cam.matrix_world.translation
-            sky_dirs = [Vector((0, 0, 1))]  # straight up
-            for angle in range(0, 360, 30):  # 12 rays at ~27° from vertical
-                r = np.deg2rad(angle)
-                sky_dirs.append(Vector((0.5 * np.cos(r), 0.5 * np.sin(r), 1)).normalized())
-            for angle in range(0, 360, 30):  # 12 rays at ~45° from vertical
-                r = np.deg2rad(angle)
-                sky_dirs.append(Vector((np.cos(r), np.sin(r), 1)).normalized())
-            open_rays = 0
-            for d in sky_dirs:
-                hit, _, _, dist = scene_bvh.ray_cast(cam_loc, d)
-                if hit is None or dist > MAX_CEILING_DIST:
-                    open_rays += 1
-            if open_rays / len(sky_dirs) < MIN_OPEN_FRAC:
-                rejection_counts["inside_building"] += 1
-                continue
+            # "open" readings. This catches OUTDOOR cameras stuck inside/under a
+            # building, but indoors the ceiling is always overhead, so it would
+            # reject every valid pose -- disable it for indoor (sky_visibility_check
+            # = False) where the room itself is the intended enclosure.
+            if sky_visibility_check:
+                MAX_CEILING_DIST = 200.0  # no real building taller than this
+                MIN_OPEN_FRAC = 0.3       # at least 30% of upward rays must see sky
+                cam_loc = cam.matrix_world.translation
+                sky_dirs = [Vector((0, 0, 1))]  # straight up
+                for angle in range(0, 360, 30):  # 12 rays at ~27° from vertical
+                    r = np.deg2rad(angle)
+                    sky_dirs.append(Vector((0.5 * np.cos(r), 0.5 * np.sin(r), 1)).normalized())
+                for angle in range(0, 360, 30):  # 12 rays at ~45° from vertical
+                    r = np.deg2rad(angle)
+                    sky_dirs.append(Vector((np.cos(r), np.sin(r), 1)).normalized())
+                open_rays = 0
+                for d in sky_dirs:
+                    hit, _, _, dist = scene_bvh.ray_cast(cam_loc, d)
+                    if hit is None or dist > MAX_CEILING_DIST:
+                        open_rays += 1
+                if open_rays / len(sky_dirs) < MIN_OPEN_FRAC:
+                    rejection_counts["inside_building"] += 1
+                    continue
 
             # Panoramic enclosure check (city path): the final render is a full
             # 360° equirectangular panorama, so a forward pinhole / upward-only
@@ -650,7 +656,7 @@ def compute_base_views(
             # rays against the (instance-aware) BVH and apply the SAME thresholds
             # the post-render depth check used, making that check redundant.
             if panoramic_enclosure_check:
-                max_depth, clip_frac, sky_frac, far_frac = panoramic_depth_stats(
+                max_depth, clip_frac, sky_frac, far_frac, near_frac = panoramic_depth_stats(
                     cam.matrix_world.translation, scene_bvh
                 )
                 if max_depth < 2.0:
@@ -664,6 +670,13 @@ def compute_base_views(
                 # sky but plenty of far geometry down the street.)
                 if sky_frac < 0.12 and far_frac < 0.12:
                     rejection_counts["pano_inside_building"] += 1
+                    continue
+                # Low-parallax reject (urban multi-view): an open plaza / wide road
+                # with buildings > near_dist away gives a small-baseline rig almost
+                # no parallax, so it's poor GS supervision. Off by default
+                # (min_pano_near_frac=0); the urban path sets it.
+                if near_frac < min_pano_near_frac:
+                    rejection_counts["pano_low_parallax"] += 1
                     continue
 
             # Compute focus distance
@@ -778,9 +791,9 @@ def build_instance_aware_bvh(exclude_prefix="Culling"):
 
 
 def panoramic_depth_stats(origin, scene_bvh, n_theta=128, n_phi=256, sky_dist=1e4,
-                          far_dist=30.0):
+                          far_dist=30.0, near_dist=8.0, horiz_deg=8.0):
     """Raycast a full equirectangular sphere of directions from ``origin`` against
-    ``scene_bvh`` and return ``(max_depth, clip_frac, sky_frac, far_frac)``.
+    ``scene_bvh`` and return ``(max_depth, clip_frac, sky_frac, far_frac, near_frac)``.
 
     Directions are sampled on a lat/long grid, matching how equirectangular pixels
     tile the sphere (denser toward the poles), so the returned fractions equal the
@@ -793,6 +806,13 @@ def panoramic_depth_stats(origin, scene_bvh, n_theta=128, n_phi=256, sky_dist=1e
     partly open. ``far_frac`` (fraction seeing beyond ``far_dist`` m) is returned
     alongside ``sky_frac`` because an inside-building view can have ~0 open sky yet
     a sliver of distant street; requiring BOTH to be low is a robust enclosure test.
+
+    ``near_frac`` is the fraction of the HORIZONTAL band (rays within ``horiz_deg``
+    of the equator/horizon) that hit geometry within ``near_dist`` m. It measures
+    how much nearby, parallax-giving content the panorama has -- a low value means
+    an open plaza / wide road where a small-baseline rig sees almost no motion, so
+    the urban path rejects such poses. Only the horizontal band is used: the ground
+    straight down is always 'near' but gives no useful parallax.
     """
     origin = Vector(origin)
     thetas = np.pi * (np.arange(n_theta) + 0.5) / n_theta
@@ -806,11 +826,16 @@ def panoramic_depth_stats(origin, scene_bvh, n_theta=128, n_phi=256, sky_dist=1e
                 origin, Vector((st * np.cos(ph), st * np.sin(ph), ct))
             )
             depths[i, j] = miss if dist is None else dist
+    # Horizontal band: rows whose polar angle is within horiz_deg of the equator.
+    band = np.abs(np.degrees(thetas) - 90.0) <= horiz_deg
+    band_depths = depths[band]
+    near_frac = float((band_depths < near_dist).mean()) if band_depths.size else 0.0
     return (
         float(depths.max()),
         float((depths < 0.5).mean()),
         float((depths > sky_dist).mean()),
         float((depths > far_dist).mean()),
+        near_frac,
     )
 
 

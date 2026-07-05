@@ -16,17 +16,31 @@ camera.spawn_camera_rigs.n_camera_rigs = 1
 camera.spawn_camera_rigs.camera_rig_config = @camera.multiview_rig_config()
 
 camera.multiview_rig_config.n_views = 8
-# Baseline drawn uniformly PER SCENE (mean 0.3 m) for baseline diversity. Rooms
-# are small and cluttered -- every sub-camera must stay clear of walls/furniture
-# -- so keep the range modest. Use a plain float to fix it.
-camera.multiview_rig_config.baseline = ("uniform", 0.2, 0.4)   # metres (indoor)
+# Baseline drawn uniformly PER SCENE for baseline diversity. Rooms are small and
+# densely furnished, and EVERY sub-camera of the ring must clear the furniture, so
+# a wide ring finds no valid anchor at all. Keep it small (mean ~0.18 m) -- with
+# full-360 panoramas even this gives usable parallax. Use a plain float to fix it.
+camera.multiview_rig_config.baseline = ("uniform", 0.1, 0.25)  # metres (indoor)
 camera.multiview_rig_config.pattern = "ring"     # "ring" | "sphere"
-camera.multiview_rig_config.z_amplitude = 0.1    # +/- vertical parallax for the ring
+camera.multiview_rig_config.z_amplitude = 0.05   # +/- vertical parallax for the ring
 camera.multiview_rig_config.level_pitch_deg = 90 # must match camera_pose_proposal.pitch
 
 # Level, horizon-facing panoramas.
 camera.camera_pose_proposal.pitch = 90
 camera.camera_pose_proposal.roll = 0
+
+# The indoor base requires every camera to be >= 0.7 m from any surface. That is
+# fine for a single camera but nearly impossible for a 4-8 camera ring in a small
+# densely-furnished room: some sub-camera is almost always closer than 0.7 m, so
+# placement finds ZERO candidates and the job spins forever. Relax it -- 0.2 m
+# still keeps cameras out of (not inside) furniture, and close surfaces give a
+# panorama MORE parallax, which is exactly what the GS head wants.
+keep_cam_pose_proposal.min_terrain_distance = 0.15
+
+# compute_base_views' upward sky-ray check ("inside_building") is for OUTDOOR
+# cameras stuck under a building; indoors the ceiling is always overhead, so it
+# rejects every valid pose. Turn it off for indoor.
+compute_base_views.sky_visibility_check = False
 
 # One valid anchor per scene is enough; don't over-search when validating N
 # sub-cameras per candidate.
