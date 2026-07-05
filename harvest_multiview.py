@@ -27,6 +27,7 @@ Example:
 import argparse
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -221,14 +222,26 @@ def spawn_rig(rig_id, offsets):
 # --------------------------------------------------------------------------- #
 def render_camera(cam, frames_dir, resolution, samples):
     """Render one camera as a panorama: beauty (RGB PNG + pose) then GT
-    (metric depth + normals). Mirrors the datagen's rendershort + blendergt."""
+    (metric depth + normals). Mirrors the datagen's rendershort + blendergt.
+
+    The two render_image passes MUST land in separate folders. The GT pass uses
+    flat/clay shading (global_flat_shading), which (a) also writes an ``Image``
+    file -- a flat-shaded render that would overwrite the real beauty RGB -- and
+    (b) never reverts the materials, so beauty must render FIRST. We therefore
+    render each pass into its own ``_pass_*`` dir and copy only the channels we
+    want (beauty -> Image + camview, GT -> Depth + SurfaceNormal) into frames_dir.
+    """
     scene = bpy.context.scene
     scene.cycles.samples = samples
-    for passes, flat, ovr in [
-        ([], False, None),  # beauty -> Image + camview
-        ([("z", "Depth"), ("normal", "Normal")], True, 16),  # GT -> Depth + SurfaceNormal
-    ]:
-        stage = frames_dir.parent / "frames_stage"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    # (tag, passes, flat_shading, num_samples_override, channels-to-keep)
+    passes_spec = [
+        ("beauty", [], False, None, ("Image", "camview")),
+        ("gt", [("z", "Depth"), ("normal", "Normal")], True, 16, ("Depth", "SurfaceNormal")),
+    ]
+    for tag, passes, flat, ovr, keep in passes_spec:
+        pass_root = frames_dir.parent / f"_pass_{tag}"
+        stage = pass_root / "frames_stage"
         stage.mkdir(parents=True, exist_ok=True)
         render_mod.render_image(
             camera=cam,
@@ -238,6 +251,17 @@ def render_camera(cam, frames_dir, resolution, samples):
             render_resolution_override=resolution,
             override_num_samples=ovr,
         )  # render_image reorganizes `stage` into `stage.parent/frames`
+        pass_frames = pass_root / "frames"
+        for ch in keep:  # merge only the wanted channels into the shared frames_dir
+            src = pass_frames / ch
+            if not src.is_dir():
+                continue
+            for camdir in src.iterdir():
+                ddir = frames_dir / ch / camdir.name
+                ddir.mkdir(parents=True, exist_ok=True)
+                for f in camdir.iterdir():
+                    shutil.move(str(f), str(ddir / f.name))
+        shutil.rmtree(pass_root, ignore_errors=True)
 
 
 def set_data_color_management():
