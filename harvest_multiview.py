@@ -87,13 +87,24 @@ def build_instance_aware_bvh(exclude_prefix=("camera", "camrig", "Camera")):
         return geom
 
     verts, faces, off = [], [], 0
-    n_inst = n_base = 0
+    n_inst = n_base = n_hidden = 0
     for inst in deps.object_instances:
         ob = inst.object
         if ob is None or ob.type != "MESH" or ob.data is None:
             continue
         holder = inst.parent if inst.is_instance else ob
         if holder is not None and holder.name.startswith(tuple(exclude_prefix)):
+            continue
+        # Skip geometry hidden from the RENDER. Layout placeholders (Boulder/asset
+        # bbox_placeholder & spawn_placeholder, etc.) and other helper meshes live
+        # in the viewport depsgraph the BVH is built from but never render, so
+        # raycasts hit them as "phantom" near-surfaces the rendered depth doesn't
+        # have -- which made the placement parallax check (panoramic_stats) read
+        # far more near content than the panorama actually shows. Checking the
+        # HOLDER (instancer for instances, the object itself for base meshes) keeps
+        # rendered geometry-node instances whose hidden SOURCE mesh is instanced.
+        if holder is not None and holder.hide_render:
+            n_hidden += 1
             continue
         geom = _local(ob)
         if geom is None:
@@ -109,7 +120,8 @@ def build_instance_aware_bvh(exclude_prefix=("camera", "camrig", "Camera")):
         raise ValueError("build_instance_aware_bvh found no geometry")
     allv = np.concatenate(verts, axis=0)
     logger.info(
-        f"BVH: {n_base} base + {n_inst} instances -> {len(allv)} verts, {len(faces)} tris"
+        f"BVH: {n_base} base + {n_inst} instances "
+        f"(skipped {n_hidden} render-hidden) -> {len(allv)} verts, {len(faces)} tris"
     )
     return BVHTree.FromPolygons(allv.tolist(), faces, all_triangles=True), allv
 
