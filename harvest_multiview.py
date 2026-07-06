@@ -127,36 +127,50 @@ def build_instance_aware_bvh(exclude_prefix=("camera", "camrig", "Camera")):
 
 
 def panoramic_stats(origin, bvh, near_dist=8.0, horiz_deg=8.0,
-                    n_theta=24, n_phi=48, sky_dist=1e4):
-    """Over a lat/long sphere of rays from `origin`, return
-    ``(sky_frac, near_frac)``:
-      - sky_frac: fraction of ALL rays that miss geometry (open sky).
+                    n_theta=24, n_phi=48, sky_dist=1e4, n_band=16):
+    """Cast rays from `origin` and return ``(sky_frac, near_frac)``:
+      - sky_frac: fraction of a coarse full-sphere set of rays that miss geometry
+        (open sky) -- yaw-independent, used to reject fully enclosed poses.
       - near_frac: fraction of the HORIZONTAL band (within `horiz_deg` of the
-        equator) that hits geometry within `near_dist` m. Only the horizontal
-        band is used because that's where nearby objects (trees, walls,
-        buildings) live -- the ground straight down is always 'near' but gives
-        no parallax, and the sky straight up is empty.
+        equator) that hits geometry within `near_dist` m -- the parallax-giving
+        content at eye level (the ground straight down is always 'near' but gives
+        no parallax, and the sky straight up is empty).
+
+    The band is sampled with its OWN dense set of `n_band` elevation rings across
+    +/-horiz_deg so this raycast measure matches build_multiview_manifest's
+    _anchor_near_frac, which averages the rendered depth over the same +/-8 deg
+    band. Sampling only 2 coarse rings (as a shared n_theta grid would) sits right
+    at the horizon and over-reads near content versus the rendered panorama.
     """
     origin = Vector(origin)
-    thetas = np.pi * (np.arange(n_theta) + 0.5) / n_theta
     phis = 2 * np.pi * (np.arange(n_phi) + 0.5) / n_phi
+
+    # sky_frac: coarse full sphere.
+    thetas = np.pi * (np.arange(n_theta) + 0.5) / n_theta
     miss = 0
-    near = 0
-    horiz = 0
     for th in thetas:
         st, ct = np.sin(th), np.cos(th)
-        is_horiz = abs(np.degrees(th) - 90.0) <= horiz_deg
         for ph in phis:
             _, _, _, d = bvh.ray_cast(
                 origin, Vector((st * np.cos(ph), st * np.sin(ph), ct))
             )
             if d is None or d > sky_dist:
                 miss += 1
-            if is_horiz:
-                horiz += 1
-                if d is not None and d <= sky_dist and d < near_dist:
-                    near += 1
-    return miss / (n_theta * n_phi), (near / horiz if horiz else 0.0)
+    sky_frac = miss / (n_theta * n_phi)
+
+    # near_frac: dense horizontal band, matching the manifest's +/-horiz_deg band.
+    band_th = np.radians(90.0 + np.linspace(-horiz_deg, horiz_deg, n_band))
+    near = tot = 0
+    for th in band_th:
+        st, ct = np.sin(th), np.cos(th)
+        for ph in phis:
+            _, _, _, d = bvh.ray_cast(
+                origin, Vector((st * np.cos(ph), st * np.sin(ph), ct))
+            )
+            tot += 1
+            if d is not None and d <= sky_dist and d < near_dist:
+                near += 1
+    return sky_frac, (near / tot if tot else 0.0)
 
 
 # --------------------------------------------------------------------------- #
