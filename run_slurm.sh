@@ -105,10 +105,12 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
     BASELINE=${BASELINE:-uniform,0.3,0.7}
     RES=${RES:-4096,2048}
     SAMPLE_RADIUS=${SAMPLE_RADIUS:-30}
-    # Min fraction of the horizontal band with content within --near-dist for an
-    # anchor to be accepted -- rejects sparse, no-parallax poses. Sparse scenes
-    # (open terrain) may yield 0 rigs at the default; lower MIN_NEAR to keep them.
+    # Parallax control. MIN_NEAR = the near-content fraction that makes a rig
+    # "rich" (high parallax); rich anchors are always kept. SPARSE_FRAC = the max
+    # fraction of a scene's rigs allowed to be low-parallax, so the dataset keeps
+    # SOME open/parallax-free views without them dominating (0 = rich only).
     MIN_NEAR=${MIN_NEAR:-0.2}
+    SPARSE_FRAC=${SPARSE_FRAC:-0.2}
     scene_dir="${base_output}/scene"
     mv_dir="${base_output}/multiview"
 
@@ -133,7 +135,8 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
     echo "Harvesting ${RIGS_PER_SCENE} multi-view set(s) from $blend ..."
     python harvest_multiview.py --scene-blend "$blend" --output "$mv_dir" \
         --rigs-per-scene "$RIGS_PER_SCENE" --n-views "$N_VIEWS" --baseline "$BASELINE" \
-        --resolution "$RES" --sample-radius "$SAMPLE_RADIUS" --min-near "$MIN_NEAR" \
+        --resolution "$RES" --sample-radius "$SAMPLE_RADIUS" \
+        --min-near "$MIN_NEAR" --sparse-frac "$SPARSE_FRAC" \
         --seed "${SLURM_ARRAY_TASK_ID:-0}"
 
     # The multi-view sets are in $mv_dir; the source scene (incl. the ~1-2 GB

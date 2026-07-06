@@ -169,8 +169,9 @@ def sampling_bounds(all_verts, gen_cam_locs, radius, central):
 
 def find_and_place_anchor(rig, cams, bvh, bounds, altitude, min_clear, min_sky,
                           min_near, near_dist, tries):
-    """Move `rig` (and its sub-cameras `cams`) to a valid anchor. Returns True on
-    success. A pose is valid when:
+    """Move `rig` (and its sub-cameras `cams`) to a valid anchor. Returns the
+    anchor's near_frac (>= 0) on success, or None if no valid pose was found.
+    A pose is valid when:
       - every sub-camera is >= min_clear m from any surface (not underground /
         not inside a prop),
       - the anchor sees >= min_sky open sky, AND
@@ -199,8 +200,9 @@ def find_and_place_anchor(rig, cams, bvh, bounds, altitude, min_clear, min_sky,
         sky, near = panoramic_stats(cams[0].matrix_world.translation, bvh, near_dist)
         if sky < min_sky or near < min_near:
             continue
-        return True
-    return False
+        return near  # placed; return the anchor's near_frac (>= 0) so the caller
+        #              can account for it against the per-scene sparse budget
+    return None
 
 
 def spawn_rig(rig_id, offsets):
@@ -220,48 +222,52 @@ def spawn_rig(rig_id, offsets):
 # --------------------------------------------------------------------------- #
 # Rendering (reuses infinigen's full/flat render_image passes).
 # --------------------------------------------------------------------------- #
-def render_camera(cam, frames_dir, resolution, samples):
-    """Render one camera as a panorama: beauty (RGB PNG + pose) then GT
-    (metric depth + normals). Mirrors the datagen's rendershort + blendergt.
-
-    The two render_image passes MUST land in separate folders. The GT pass uses
-    flat/clay shading (global_flat_shading), which (a) also writes an ``Image``
-    file -- a flat-shaded render that would overwrite the real beauty RGB -- and
-    (b) never reverts the materials, so beauty must render FIRST. We therefore
-    render each pass into its own ``_pass_*`` dir and copy only the channels we
-    want (beauty -> Image + camview, GT -> Depth + SurfaceNormal) into frames_dir.
-    """
+def _render_pass(cam, frames_dir, resolution, samples, passes, flat, ovr, keep):
+    """Render ONE pass of one camera, then flatten the wanted channels into
+    frames_dir/<Channel>/ (no per-camera subfolder -- suffixes are unique, so a
+    whole scene's views for a modality share one folder for easy manipulation)."""
     scene = bpy.context.scene
     scene.cycles.samples = samples
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    # (tag, passes, flat_shading, num_samples_override, channels-to-keep)
-    passes_spec = [
-        ("beauty", [], False, None, ("Image", "camview")),
-        ("gt", [("z", "Depth"), ("normal", "Normal")], True, 16, ("Depth", "SurfaceNormal")),
-    ]
-    for tag, passes, flat, ovr, keep in passes_spec:
-        pass_root = frames_dir.parent / f"_pass_{tag}"
-        stage = pass_root / "frames_stage"
-        stage.mkdir(parents=True, exist_ok=True)
-        render_mod.render_image(
-            camera=cam,
-            frames_folder=stage,
-            passes_to_save=passes,
-            flat_shading=flat,
-            render_resolution_override=resolution,
-            override_num_samples=ovr,
-        )  # render_image reorganizes `stage` into `stage.parent/frames`
-        pass_frames = pass_root / "frames"
-        for ch in keep:  # merge only the wanted channels into the shared frames_dir
-            src = pass_frames / ch
-            if not src.is_dir():
-                continue
-            for camdir in src.iterdir():
-                ddir = frames_dir / ch / camdir.name
-                ddir.mkdir(parents=True, exist_ok=True)
-                for f in camdir.iterdir():
-                    shutil.move(str(f), str(ddir / f.name))
-        shutil.rmtree(pass_root, ignore_errors=True)
+    pass_root = frames_dir.parent / "_pass_stage"
+    stage = pass_root / "frames_stage"
+    stage.mkdir(parents=True, exist_ok=True)
+    render_mod.render_image(
+        camera=cam,
+        frames_folder=stage,
+        passes_to_save=passes,
+        flat_shading=flat,
+        render_resolution_override=resolution,
+        override_num_samples=ovr,
+    )  # render_image reorganizes `stage` into `stage.parent/frames/<Channel>/camera_<s>/`
+    pass_frames = pass_root / "frames"
+    for ch in keep:
+        src = pass_frames / ch
+        if not src.is_dir():
+            continue
+        dst = frames_dir / ch
+        dst.mkdir(parents=True, exist_ok=True)
+        for entry in src.rglob("*"):  # flatten: pull every file up into frames_dir/<ch>/
+            if entry.is_file():
+                shutil.move(str(entry), str(dst / entry.name))
+    shutil.rmtree(pass_root, ignore_errors=True)
+
+
+# The GT pass uses global_flat_shading(), which PERMANENTLY swaps the scene's
+# materials to clay and never reverts them -- so every beauty render after the
+# first GT pass would come out flat-shaded (looking like segmentation). Render is
+# therefore split into two phases at the SCENE level: all beauty passes first
+# (materials still original), then all GT passes.
+def render_beauty(cam, frames_dir, resolution, samples):
+    """Beauty pass: textured RGB (Image) + camera pose (camview)."""
+    _render_pass(cam, frames_dir, resolution, samples,
+                 passes=[], flat=False, ovr=None, keep=("Image", "camview"))
+
+
+def render_gt(cam, frames_dir, resolution, samples):
+    """Ground-truth pass (flat-shaded): metric depth + surface normals."""
+    _render_pass(cam, frames_dir, resolution, samples,
+                 passes=[("z", "Depth"), ("normal", "Normal")], flat=True, ovr=16,
+                 keep=("Depth", "SurfaceNormal"))
 
 
 def set_data_color_management():
@@ -299,6 +305,13 @@ def harvest_scene(blend_path, out_root, args):
     bvh, all_verts = build_instance_aware_bvh()
     bounds = sampling_bounds(all_verts, gen_cam_locs, args.sample_radius, args.central)
 
+    # Placement PREFERS high-parallax anchors (near_frac >= min_near), but keeps a
+    # small per-scene budget of low-parallax ("sparse") rigs so the dataset still
+    # contains SOME open/parallax-free views without letting them dominate. On a
+    # rich scene every rig is rich (0 sparse); on a sparse scene only the budgeted
+    # rigs get placed, so sparse scenes contribute few views overall.
+    n_sparse_allowed = int(np.ceil(args.sparse_frac * args.rigs_per_scene))
+    n_sparse = 0
     placed = []
     for k in range(args.rigs_per_scene):
         cfg = cam_util.multiview_rig_config(
@@ -308,17 +321,29 @@ def harvest_scene(blend_path, out_root, args):
             z_amplitude=args.z_amplitude,
         )
         rig, cams = spawn_rig(k, cfg)
-        if find_and_place_anchor(
+        # First insist on a rich anchor; only if none is found AND we still have
+        # sparse budget, fall back to accepting any (min_near=0) anchor.
+        near = find_and_place_anchor(
             rig, cams, bvh, bounds, args.altitude,
             args.min_clearance, args.min_sky, args.min_near, args.near_dist,
             args.place_tries,
-        ):
-            b = np.linalg.norm(cams[1].matrix_world.translation - cams[0].matrix_world.translation)
-            logger.info(f"  rig {k}: placed (baseline~{b:.2f} m)")
-            placed.append((rig, cams))
-        else:
+        )
+        if near is None and n_sparse < n_sparse_allowed:
+            near = find_and_place_anchor(
+                rig, cams, bvh, bounds, args.altitude,
+                args.min_clearance, args.min_sky, 0.0, args.near_dist,
+                args.place_tries,
+            )
+        if near is None:
             logger.warning(f"  rig {k}: no valid anchor in {args.place_tries} tries (skipped)")
             butil.delete([rig, *cams])
+            continue
+        sparse = near < args.min_near
+        n_sparse += sparse
+        b = np.linalg.norm(cams[1].matrix_world.translation - cams[0].matrix_world.translation)
+        logger.info(f"  rig {k}: placed (baseline~{b:.2f} m, near_frac={near:.2f}"
+                    f"{', SPARSE' if sparse else ''})")
+        placed.append((rig, cams))
 
     if not placed:
         logger.warning(f"  scene {scene_name}: no rigs placed, nothing to render")
@@ -326,11 +351,19 @@ def harvest_scene(blend_path, out_root, args):
 
     frames = out_dir / "frames"
     frames.mkdir(parents=True, exist_ok=True)
+    res = tuple(args.resolution)
+    # Two phases (see render_beauty/render_gt): every beauty first while materials
+    # are original, THEN every GT once flat-shading has been applied scene-wide.
     for rig, cams in placed:
         for cam in cams:
-            logger.info(f"  rendering {cam.name}")
-            render_camera(cam, frames, tuple(args.resolution), args.samples)
-    logger.info(f"  scene {scene_name}: rendered {len(placed)} rig(s), {sum(len(c) for _, c in placed)} views")
+            logger.info(f"  beauty {cam.name}")
+            render_beauty(cam, frames, res, args.samples)
+    for rig, cams in placed:
+        for cam in cams:
+            logger.info(f"  gt {cam.name}")
+            render_gt(cam, frames, res, args.samples)
+    logger.info(f"  scene {scene_name}: rendered {len(placed)} rig(s), "
+                f"{sum(len(c) for _, c in placed)} views ({n_sparse} sparse)")
     return len(placed)
 
 
@@ -376,8 +409,12 @@ def main():
     ap.add_argument("--min-clearance", type=float, default=0.3, help="min metres from any surface per sub-camera")
     ap.add_argument("--min-sky", type=float, default=0.1, help="min open-sky fraction at the anchor")
     ap.add_argument("--min-near", type=float, default=0.2,
-                    help="min fraction of the horizontal band with content within "
-                    "--near-dist (rejects empty/no-parallax poses; 0 to disable)")
+                    help="a rig is 'rich' when this fraction of the horizontal band "
+                    "has content within --near-dist; rich anchors are always kept")
+    ap.add_argument("--sparse-frac", type=float, default=0.2,
+                    help="max fraction of a scene's rigs allowed to be low-parallax "
+                    "(near_frac < --min-near). Keeps SOME sparse/open views in the "
+                    "dataset without letting them dominate; 0 = rich only")
     ap.add_argument("--near-dist", type=float, default=8.0,
                     help="metres: content closer than this counts as parallax-giving")
     ap.add_argument("--place-tries", type=int, default=3000)

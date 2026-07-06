@@ -44,19 +44,22 @@ CHANNELS = {
 
 def _find_channel_file(frames: Path, channel: str, subcam: int, suffix: str):
     """Return the path (relative to `frames`) of channel `channel` for this view,
-    or None if missing. Tries the expected name first, then a glob fallback."""
+    or None if missing. Handles the flat layout (frames/<Channel>/<prefix><suffix>)
+    that harvest_multiview writes, as well as the datagen's nested
+    frames/<Channel>/camera_<subcam>/ layout. Exact name first, then a glob."""
     prefix, exts = CHANNELS[channel]
-    cam_dir = frames / channel / f"camera_{subcam}"
-    for ext in exts:
-        cand = cam_dir / f"{prefix}{suffix}{ext}"
-        if cand.exists():
-            return cand.relative_to(frames).as_posix()
-    # fallback: any file with the matching suffix in that camera dir
-    if cam_dir.is_dir():
+    search_dirs = [frames / channel, frames / channel / f"camera_{subcam}"]
+    for d in search_dirs:
         for ext in exts:
-            hits = sorted(cam_dir.glob(f"{prefix}{suffix}*{ext}"))
-            if hits:
-                return hits[0].relative_to(frames).as_posix()
+            cand = d / f"{prefix}{suffix}{ext}"
+            if cand.exists():
+                return cand.relative_to(frames).as_posix()
+    for d in search_dirs:  # fallback: any file with the matching suffix
+        if d.is_dir():
+            for ext in exts:
+                hits = sorted(d.glob(f"{prefix}{suffix}*{ext}"))
+                if hits:
+                    return hits[0].relative_to(frames).as_posix()
     return None
 
 
