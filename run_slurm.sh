@@ -92,8 +92,8 @@ elif [ "$SCENE_TYPE" == "multiview" ]; then
     python -m infinigen.datagen.manage_jobs --output_folder "$base_output" --num_scenes $num_scenes \
         --configs $SCENE_CONFIGS \
         --pipeline_configs $PIPE_CONFIGS \
-        --pipeline_overrides LocalScheduleHandler.use_gpu=True manage_datagen_jobs.num_concurrent=$num_concurrent iterate_scene_tasks.n_subcams=$N_VIEWS iterate_scene_tasks.n_camera_rigs=$N_RIGS $RES_OVR $DOMAIN_PIPE_OVR \
-        --overrides camera.camera_pose_proposal.pitch=90 camera.camera_pose_proposal.roll=0 camera.multiview_rig_config.n_views=$N_VIEWS camera.spawn_camera_rigs.n_camera_rigs=$N_RIGS $BASELINE_OVR $DOMAIN_OVR \
+        --pipeline_overrides LocalScheduleHandler.use_gpu=True manage_datagen_jobs.num_concurrent=$num_concurrent iterate_scene_tasks.n_subcams=$N_VIEWS iterate_scene_tasks.n_camera_rigs=$N_RIGS $DOMAIN_PIPE_OVR \
+        --overrides camera.camera_pose_proposal.pitch=90 camera.camera_pose_proposal.roll=0 camera.multiview_rig_config.n_views=$N_VIEWS camera.spawn_camera_rigs.n_camera_rigs=$N_RIGS $RES_OVR $BASELINE_OVR $DOMAIN_OVR \
         --wandb_mode disabled
 
     # Build the per-scene pose manifests (and prune Objects/UniqueInstances/imu_tum/.exr).

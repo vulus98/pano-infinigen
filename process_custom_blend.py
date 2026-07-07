@@ -582,8 +582,15 @@ def main(args):
     # which expects to reorganize files from 'frames_folder' into 'frames_folder/../frames' or 'frames_folder/Type/...'
     # By using a 'frames' subfolder, we ensure consistent behavior.
     frames_folder = output_folder / "frames"
+    # Start from a clean frames dir. render_image -> reorganize_old_framesfolder
+    # calls parse_suffix() on EVERY file directly in frames/, so a stale file from
+    # a previous run (e.g. transforms.json) has no parseable suffix and crashes it
+    # with "'NoneType' object is not subscriptable". A fresh render must own the dir.
+    import shutil as _shutil
+    if frames_folder.exists():
+        _shutil.rmtree(frames_folder)
     frames_folder.mkdir(parents=True, exist_ok=True)
-    
+
     # Force single frame render
     bpy.context.scene.frame_start = 1
     bpy.context.scene.frame_end = 1
