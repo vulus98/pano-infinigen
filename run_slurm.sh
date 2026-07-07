@@ -125,19 +125,37 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
     # scene "done" once its render tasks succeed, so we keep a 64x32 / 1-sample
     # render (a few seconds) rather than dropping renders entirely. The real
     # panoramas are rendered by harvest_multiview.py at full RES below.
-    echo "Generating one scene (tiny throwaway render)..."
-    python -m infinigen.datagen.manage_jobs --output_folder "$scene_dir" --num_scenes 1 \
-        --configs simple.gin \
-        --pipeline_configs local_256GB.gin monocular.gin blender_gt.gin \
-        --pipeline_overrides LocalScheduleHandler.use_gpu=True manage_datagen_jobs.num_concurrent=1 \
-        --overrides camera.camera_pose_proposal.pitch=90 camera.camera_pose_proposal.roll=0 \
-            "render_image.render_resolution_override=(64, 32)" "execute_tasks.generate_resolution=(64, 32)" \
-            "configure_render_cycles.num_samples=1" \
-        --wandb_mode disabled
-
-    blend=$(find "$scene_dir" -path '*fine/scene.blend' 2>/dev/null | head -1)
+    #
+    # NOTE: we deliberately do NOT force camera_pose_proposal.pitch=90 here. This
+    # scene's generation camera is throwaway -- it only defines where assets get
+    # populated; harvest_multiview.py re-places its own pitch=90 panorama cameras
+    # afterward. Forcing the gen camera dead-horizontal over-constrains infinigen's
+    # placement and is a frequent "Could not find 1 camera views" scene-gen crash,
+    # so we let it use the default (clip_gaussian) pitch distribution instead.
+    # Scene-gen is the flaky part (infinigen asset-factory hangs, occasional
+    # placement crashes). Retry up to GEN_TRIES times with a fresh scene, each
+    # attempt hard-capped at GEN_TIMEOUT so an indefinite asset hang is killed and
+    # retried instead of burning the whole job. A fresh scene_dir => new random
+    # seed => a different scene, so a retry dodges a scene-specific hang/crash.
+    GEN_TRIES=${GEN_TRIES:-3}
+    GEN_TIMEOUT=${GEN_TIMEOUT:-50m}
+    blend=""
+    for attempt in $(seq 1 "$GEN_TRIES"); do
+        echo "Generating one scene (tiny throwaway render), attempt ${attempt}/${GEN_TRIES}..."
+        rm -rf "$scene_dir"
+        timeout "$GEN_TIMEOUT" python -m infinigen.datagen.manage_jobs --output_folder "$scene_dir" --num_scenes 1 \
+            --configs simple.gin \
+            --pipeline_configs local_256GB.gin monocular.gin blender_gt.gin \
+            --pipeline_overrides LocalScheduleHandler.use_gpu=True manage_datagen_jobs.num_concurrent=1 \
+            --overrides "render_image.render_resolution_override=(64, 32)" "execute_tasks.generate_resolution=(64, 32)" \
+                "configure_render_cycles.num_samples=1" \
+            --wandb_mode disabled
+        blend=$(find "$scene_dir" -path '*fine/scene.blend' 2>/dev/null | head -1)
+        [ -n "$blend" ] && break
+        echo "  attempt ${attempt} produced no scene (crash/timeout); retrying with a fresh scene..."
+    done
     if [ -z "$blend" ]; then
-        echo "ERROR: scene generation produced no fine/scene.blend"; exit 1
+        echo "ERROR: scene generation produced no fine/scene.blend after ${GEN_TRIES} attempts"; exit 1
     fi
     echo "Harvesting ${RIGS_PER_SCENE} multi-view set(s) from $blend ..."
     python harvest_multiview.py --scene-blend "$blend" --output "$mv_dir" \
