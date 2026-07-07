@@ -283,14 +283,38 @@ def _render_pass(cam, frames_dir, resolution, samples, passes, flat, ovr, keep):
 # first GT pass would come out flat-shaded (looking like segmentation). Render is
 # therefore split into two phases at the SCENE level: all beauty passes first
 # (materials still original), then all GT passes.
+_BEAUTY_VT_LOGGED = False
+
+
+def _set_view_transform(*candidates):
+    """Set the first available view transform from `candidates` and return it."""
+    vs = bpy.context.scene.view_settings
+    for vt in candidates:
+        try:
+            vs.view_transform = vt
+            return vt
+        except TypeError:  # not a valid enum in this Blender build
+            continue
+    return vs.view_transform
+
+
 def render_beauty(cam, frames_dir, resolution, samples):
-    """Beauty pass: textured RGB (Image) + camera pose (camview)."""
+    """Beauty pass: textured RGB (Image) + camera pose (camview). Rendered with a
+    filmic tone map (AgX, else Filmic) so bright outdoor scenes with a strong sun
+    don't clip to white -- Standard has no highlight rolloff. Depth/normals are raw
+    geometry passes, so this view transform doesn't affect the ground truth."""
+    vt = _set_view_transform("AgX", "Filmic", "Standard")
+    global _BEAUTY_VT_LOGGED
+    if not _BEAUTY_VT_LOGGED:
+        logger.info(f"beauty pass view transform: {vt}")
+        _BEAUTY_VT_LOGGED = True
     _render_pass(cam, frames_dir, resolution, samples,
                  passes=[], flat=False, ovr=None, keep=("Image", "camview"))
 
 
 def render_gt(cam, frames_dir, resolution, samples):
     """Ground-truth pass (flat-shaded): metric depth + surface normals."""
+    _set_view_transform("Standard")  # data-safe (irrelevant to the raw passes)
     _render_pass(cam, frames_dir, resolution, samples,
                  passes=[("z", "Depth"), ("normal", "Normal")], flat=True, ovr=16,
                  keep=("Depth", "SurfaceNormal"))
