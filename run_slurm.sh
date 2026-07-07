@@ -61,7 +61,12 @@ elif [ "$SCENE_TYPE" == "multiview" ]; then
     # its pose saved. N_VIEWS must be passed to BOTH config layers, hence the two
     # overrides (iterate_scene_tasks.n_subcams and multiview_rig_config.n_views).
     # MV_DOMAIN selects the scene family: outdoor (nature) or indoor.
+    # N_RIGS = independent multi-view rigs placed per scene (each an anchor + N_VIEWS
+    # sub-cameras). >1 amortizes scene-gen over several rigs -- the practical way to
+    # get multiple rigs from an INDOOR scene (the decoupled harvest workflow is
+    # outdoor-only, as it needs open sky to place anchors).
     N_VIEWS=${N_VIEWS:-8}
+    N_RIGS=${N_RIGS:-1}
     MV_DOMAIN=${MV_DOMAIN:-outdoor}
     if [ "$MV_DOMAIN" == "indoor" ]; then
         SCENE_CONFIGS="singleroom.gin fast_solve.gin multiview.gin"
@@ -81,12 +86,14 @@ elif [ "$SCENE_TYPE" == "multiview" ]; then
     else
         BASELINE_OVR=""; BL_LABEL="config range (variable)"
     fi
-    echo "Running Multi-view Panorama Generation (${MV_DOMAIN}, N_VIEWS=${N_VIEWS}, BASELINE=${BL_LABEL})..."
+    # Optional render resolution override, e.g. RES=1024,512 (default: config res).
+    if [ -n "$RES" ]; then RES_OVR="render_image.render_resolution_override=($RES)"; else RES_OVR=""; fi
+    echo "Running Multi-view Panorama Generation (${MV_DOMAIN}, N_RIGS=${N_RIGS}, N_VIEWS=${N_VIEWS}, BASELINE=${BL_LABEL})..."
     python -m infinigen.datagen.manage_jobs --output_folder "$base_output" --num_scenes $num_scenes \
         --configs $SCENE_CONFIGS \
         --pipeline_configs $PIPE_CONFIGS \
-        --pipeline_overrides LocalScheduleHandler.use_gpu=True manage_datagen_jobs.num_concurrent=$num_concurrent iterate_scene_tasks.n_subcams=$N_VIEWS $DOMAIN_PIPE_OVR \
-        --overrides camera.camera_pose_proposal.pitch=90 camera.camera_pose_proposal.roll=0 camera.multiview_rig_config.n_views=$N_VIEWS $BASELINE_OVR $DOMAIN_OVR \
+        --pipeline_overrides LocalScheduleHandler.use_gpu=True manage_datagen_jobs.num_concurrent=$num_concurrent iterate_scene_tasks.n_subcams=$N_VIEWS iterate_scene_tasks.n_camera_rigs=$N_RIGS $RES_OVR $DOMAIN_PIPE_OVR \
+        --overrides camera.camera_pose_proposal.pitch=90 camera.camera_pose_proposal.roll=0 camera.multiview_rig_config.n_views=$N_VIEWS camera.spawn_camera_rigs.n_camera_rigs=$N_RIGS $BASELINE_OVR $DOMAIN_OVR \
         --wandb_mode disabled
 
     # Build the per-scene pose manifests (and prune Objects/UniqueInstances/imu_tum/.exr).
