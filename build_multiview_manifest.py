@@ -85,10 +85,31 @@ def _anchor_near_frac(frames: Path, anchor_frame, near_dist=8.0, band=0.09):
     return round(float(np.mean(valid & (strip < near_dist))), 4)
 
 
+def flatten_frames(frames: Path):
+    """Flatten frames/<Channel>/camera_<s>/<file> -> frames/<Channel>/<file> so
+    every layout is uniform. The harvester already writes flat; the datagen paths
+    (multiview / urban) nest by sub-camera via reorganize_old_framesfolder. Suffixes
+    already encode rig+subcam, so filenames stay unique. No-op on flat input."""
+    if not frames.is_dir():
+        return
+    for channel in frames.iterdir():
+        if not channel.is_dir():
+            continue
+        for camdir in list(channel.iterdir()):
+            if camdir.is_dir() and camdir.name.startswith("camera_"):
+                for f in camdir.iterdir():
+                    dst = channel / f.name
+                    if not dst.exists():
+                        shutil.move(str(f), str(dst))
+                if not any(camdir.iterdir()):
+                    camdir.rmdir()
+
+
 def build_scene_manifests(scene_dir: Path) -> list[Path]:
     """Build one transforms_camrig_<r>.json per camera rig in this scene.
     Returns the list of manifest paths written."""
     frames = scene_dir / "frames" if (scene_dir / "frames").is_dir() else scene_dir
+    flatten_frames(frames)  # unify to the flat one-folder-per-modality layout
     camview_files = sorted(frames.glob("camview/**/camview_*.npz"))
     if not camview_files:
         print(f"  [skip] no camview npz under {frames}")

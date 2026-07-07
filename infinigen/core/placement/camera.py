@@ -756,7 +756,7 @@ def build_instance_aware_bvh(exclude_prefix="Culling"):
     all_verts = []
     all_faces = []
     voff = 0
-    n_inst = n_base = 0
+    n_inst = n_base = n_hidden = 0
     t0 = _time.perf_counter()
     for inst in depsgraph.object_instances:
         ob = inst.object
@@ -764,6 +764,13 @@ def build_instance_aware_bvh(exclude_prefix="Culling"):
             continue
         holder = inst.parent if inst.is_instance else ob
         if holder is not None and holder.name.startswith(exclude_prefix):
+            continue
+        # Skip geometry hidden from the render (layout placeholders, helper meshes):
+        # it lives in the viewport depsgraph but never renders, so raycasts hit it
+        # as phantom near-surfaces the rendered depth lacks -- which made the
+        # panoramic near/enclosure check over-read content vs the actual panorama.
+        if holder is not None and holder.hide_render:
+            n_hidden += 1
             continue
         geom = _local_geom(ob)
         if geom is None:
@@ -783,7 +790,8 @@ def build_instance_aware_bvh(exclude_prefix="Culling"):
 
     verts = np.concatenate(all_verts, axis=0)
     logger.info(
-        f"build_instance_aware_bvh: {n_base} base + {n_inst} instances -> "
+        f"build_instance_aware_bvh: {n_base} base + {n_inst} instances "
+        f"(skipped {n_hidden} render-hidden) -> "
         f"{len(verts)} verts, {len(all_faces)} tris "
         f"({_time.perf_counter() - t0:.1f}s)"
     )
