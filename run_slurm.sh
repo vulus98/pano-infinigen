@@ -112,11 +112,32 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
     BASELINE=${BASELINE:-uniform,0.3,0.7}
     RES=${RES:-4096,2048}
     SAMPLE_RADIUS=${SAMPLE_RADIUS:-30}
-    # Parallax control. MIN_NEAR = the near-content fraction that makes a rig
-    # "rich" (high parallax); rich anchors are always kept. SPARSE_FRAC = the max
-    # fraction of a scene's rigs allowed to be low-parallax, so the dataset keeps
-    # SOME open/parallax-free views without them dominating (0 = rich only).
-    MIN_NEAR=${MIN_NEAR:-0.2}
+
+    # Biome-controlled density. infinigen's scene_types is mandatory-exclusive, so
+    # if we don't name a biome it picks one at RANDOM -- landing on open
+    # deserts/plains ~half the time (sparse, low parallax), which then yields only
+    # ~1 rig/scene through the parallax gate. Instead we choose the biome and its
+    # frequency: ~2 in 10 scenes SPARSE (open), the rest DENSE (trees/rock/water =
+    # near content). With the mix controlled here we DON'T need the per-rig parallax
+    # gate, so MIN_NEAR defaults to 0 -> every scene reliably yields RIGS_PER_SCENE
+    # rigs, and ~20% of the dataset is (deliberately) sparse.
+    #   Override: BIOME=<name> forces one biome; BIOME=random restores infinigen's
+    #   random roll; SPARSE_EVERY=<n> makes 1-in-n scenes sparse (default 5 = 20%).
+    DENSE_BIOMES=(forest canyon cliff mountain river coast)
+    SPARSE_BIOMES=(desert plain arctic snowy_mountain)
+    SPARSE_EVERY=${SPARSE_EVERY:-5}
+    _idx=${SLURM_ARRAY_TASK_ID:-1}
+    if [ "$BIOME" = "random" ]; then BIOME_CFG=""
+    elif [ -n "$BIOME" ]; then BIOME_CFG="${BIOME}.gin"
+    elif [ $(( _idx % SPARSE_EVERY )) -eq 0 ]; then
+        BIOME_CFG="${SPARSE_BIOMES[$(( (_idx / SPARSE_EVERY) % ${#SPARSE_BIOMES[@]} ))]}.gin"
+    else
+        BIOME_CFG="${DENSE_BIOMES[$(( _idx % ${#DENSE_BIOMES[@]} ))]}.gin"
+    fi
+    echo "Biome for this scene: ${BIOME_CFG:-<infinigen random>}"
+    # MIN_NEAR>0 re-enables the per-rig parallax gate (+ SPARSE_FRAC budget); with
+    # biome-controlled density we keep it off so all rigs place.
+    MIN_NEAR=${MIN_NEAR:-0}
     SPARSE_FRAC=${SPARSE_FRAC:-0.2}
     scene_dir="${base_output}/scene"
     mv_dir="${base_output}/multiview"
@@ -144,7 +165,7 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
         echo "Generating one scene (tiny throwaway render), attempt ${attempt}/${GEN_TRIES}..."
         rm -rf "$scene_dir"
         timeout "$GEN_TIMEOUT" python -m infinigen.datagen.manage_jobs --output_folder "$scene_dir" --num_scenes 1 \
-            --configs simple.gin \
+            --configs simple.gin $BIOME_CFG \
             --pipeline_configs local_256GB.gin monocular.gin blender_gt.gin \
             --pipeline_overrides LocalScheduleHandler.use_gpu=True manage_datagen_jobs.num_concurrent=1 \
             --overrides "render_image.render_resolution_override=(64, 32)" "execute_tasks.generate_resolution=(64, 32)" \
