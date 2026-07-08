@@ -635,16 +635,24 @@ def main(args):
     # passes and stay consistent with the (now un-displaced) RGB. Keeps memory near
     # the ~40 GB the base geometry needs.
     sc = bpy.context.scene
-    sc.cycles.dicing_rate = 8.0
+    sc.cycles.dicing_rate = 16.0
     if hasattr(sc.cycles, "max_subdivisions"):
-        sc.cycles.max_subdivisions = 2
+        sc.cycles.max_subdivisions = 0   # no adaptive subdivision -> no displaced geo
+    # Cap texture memory: iCity has ~1000 facade materials; Cycles loads every
+    # texture at full res, which alone can be tens of GB. Simplify + a render-side
+    # texture size limit bounds that regardless of the (linked, sometimes read-only)
+    # materials.
+    sc.render.use_simplify = True
+    if hasattr(sc.cycles, "texture_limit_render"):
+        sc.cycles.texture_limit_render = "2048"
     _disp_fixed = 0
     for _m in bpy.data.materials:
         if getattr(_m, "displacement_method", "BUMP") in ("DISPLACEMENT", "BOTH"):
             _m.displacement_method = "BUMP"
             _disp_fixed += 1
-    print(f"Bounded render subdivision (dicing_rate=8, max_subdivisions=2); "
-          f"displacement->bump on {_disp_fixed} material(s)")
+    print(f"Bounded render memory (dicing=16, max_subdiv=0, tex_limit=2048, "
+          f"simplify on); displacement->bump on {_disp_fixed} material(s)", flush=True)
+    sys.stdout.flush()
 
     for rig_idx, cam_rig in enumerate(camera_rigs):
         for cam in cam_rig.children:
