@@ -78,9 +78,14 @@ def build_instance_aware_bvh(exclude_prefix=("camera", "camrig", "Camera")):
             bm.to_mesh(me)
             bm.free()
             if len(me.vertices):
+                # Keep faces/verts as numpy (not Python tuple lists) so a huge BVH
+                # builds in ~half the memory: the per-triangle tuple list + tolist()
+                # at FromPolygons were the spike. FromPolygons takes numpy directly.
                 geom = (
                     np.array([v.co[:] for v in me.vertices], dtype=np.float64),
-                    [tuple(p.vertices) for p in me.polygons],
+                    np.array([p.vertices[:] for p in me.polygons], dtype=np.int32)
+                    if len(me.polygons)
+                    else np.empty((0, 3), dtype=np.int32),
                 )
             bpy.data.meshes.remove(me)
         cache[key] = geom
@@ -112,18 +117,19 @@ def build_instance_aware_bvh(exclude_prefix=("camera", "camrig", "Camera")):
         lv, lf = geom
         M = np.array(inst.matrix_world, dtype=np.float64)
         verts.append(lv @ M[:3, :3].T + M[:3, 3])
-        faces.extend((a + off, b + off, c + off) for a, b, c in lf)
+        faces.append(lf + off)  # numpy offset, no per-triangle Python tuples
         off += len(lv)
         n_inst += inst.is_instance
         n_base += not inst.is_instance
     if not verts:
         raise ValueError("build_instance_aware_bvh found no geometry")
     allv = np.concatenate(verts, axis=0)
+    allf = np.concatenate(faces, axis=0) if faces else np.empty((0, 3), dtype=np.int32)
     logger.info(
         f"BVH: {n_base} base + {n_inst} instances "
-        f"(skipped {n_hidden} render-hidden) -> {len(allv)} verts, {len(faces)} tris"
+        f"(skipped {n_hidden} render-hidden) -> {len(allv)} verts, {len(allf)} tris"
     )
-    return BVHTree.FromPolygons(allv.tolist(), faces, all_triangles=True), allv
+    return BVHTree.FromPolygons(allv, allf, all_triangles=True), allv
 
 
 def panoramic_stats(origin, bvh, near_dist=8.0, horiz_deg=8.0,

@@ -747,7 +747,16 @@ def build_instance_aware_bvh(exclude_prefix="Culling"):
             bm.free()
             if len(me.vertices):
                 verts = np.array([v.co[:] for v in me.vertices], dtype=np.float64)
-                faces = [tuple(p.vertices) for p in me.polygons]
+                # (F,3) int array -- faces are triangles after triangulate(). Keeping
+                # faces/verts as numpy (never Python lists of tuples) is what lets a
+                # 100M-tri iCity BVH build in ~25 GB instead of ~50 GB: the old
+                # per-triangle tuple list + verts.tolist() at FromPolygons were the
+                # spike. BVHTree.FromPolygons accepts numpy arrays directly.
+                faces = (
+                    np.array([p.vertices[:] for p in me.polygons], dtype=np.int32)
+                    if len(me.polygons)
+                    else np.empty((0, 3), dtype=np.int32)
+                )
                 geom = (verts, faces)
             bpy.data.meshes.remove(me)
         local_cache[key] = geom
@@ -778,7 +787,7 @@ def build_instance_aware_bvh(exclude_prefix="Culling"):
         lv, lf = geom
         M = np.array(inst.matrix_world, dtype=np.float64)
         all_verts.append(lv @ M[:3, :3].T + M[:3, 3])
-        all_faces.extend((a + voff, b + voff, c + voff) for a, b, c in lf)
+        all_faces.append(lf + voff)  # numpy offset, no per-triangle Python tuples
         voff += len(lv)
         if inst.is_instance:
             n_inst += 1
@@ -789,13 +798,14 @@ def build_instance_aware_bvh(exclude_prefix="Culling"):
         raise ValueError("build_instance_aware_bvh found no geometry")
 
     verts = np.concatenate(all_verts, axis=0)
+    faces = np.concatenate(all_faces, axis=0) if all_faces else np.empty((0, 3), dtype=np.int32)
     logger.info(
         f"build_instance_aware_bvh: {n_base} base + {n_inst} instances "
         f"(skipped {n_hidden} render-hidden) -> "
-        f"{len(verts)} verts, {len(all_faces)} tris "
+        f"{len(verts)} verts, {len(faces)} tris "
         f"({_time.perf_counter() - t0:.1f}s)"
     )
-    return BVHTree.FromPolygons(verts.tolist(), all_faces, all_triangles=True)
+    return BVHTree.FromPolygons(verts, faces, all_triangles=True)
 
 
 def panoramic_depth_stats(origin, scene_bvh, n_theta=128, n_phi=256, sky_dist=1e4,
