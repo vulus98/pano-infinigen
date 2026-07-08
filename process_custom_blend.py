@@ -617,6 +617,27 @@ def main(args):
     bpy.context.scene.render.resolution_y = render_res[1]
     print(f"Restored resolution to {render_res} for rendering...")
 
+    # Bound render-time subdivision. iCity materials use REAL displacement, and the
+    # blend ships with Cycles adaptive dicing at dicing_rate=1.0 / max_subdivisions
+    # up to 12. In a 360 panorama every surface is "up close", so Cycles dices large
+    # displaced facades to ~1px = billions of micro-triangles at RENDER time (unseen
+    # in the ~99M viewport tri count) -> some cities OOM at >288 GB. Coarsen the
+    # dicing, cap the subdivision depth, and drop real displacement to bump (shading
+    # only) so no extra geometry is generated. Depth/normals come from the geometry
+    # passes and stay consistent with the (now un-displaced) RGB. Keeps memory near
+    # the ~40 GB the base geometry needs.
+    sc = bpy.context.scene
+    sc.cycles.dicing_rate = 8.0
+    if hasattr(sc.cycles, "max_subdivisions"):
+        sc.cycles.max_subdivisions = 2
+    _disp_fixed = 0
+    for _m in bpy.data.materials:
+        if getattr(_m, "displacement_method", "BUMP") in ("DISPLACEMENT", "BOTH"):
+            _m.displacement_method = "BUMP"
+            _disp_fixed += 1
+    print(f"Bounded render subdivision (dicing_rate=8, max_subdivisions=2); "
+          f"displacement->bump on {_disp_fixed} material(s)")
+
     for rig_idx, cam_rig in enumerate(camera_rigs):
         for cam in cam_rig.children:
             cam.data.clip_start = clip_start
