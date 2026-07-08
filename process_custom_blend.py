@@ -565,6 +565,14 @@ def main(args):
         panoramic_enclosure_check=True,
     )
 
+    # Free the placement collision BVH (the instance-aware BVHTree over ~100M tris
+    # is ~28 GB) before rendering -- the render doesn't need it, and holding it while
+    # Cycles builds its own render BVH is what tips large cities over the memory
+    # limit. Cameras are already placed on the rigs, so this is safe.
+    import gc as _gc
+    del scene_preprocessed
+    _gc.collect()
+
     # Print found camera positions
     for i, rig in enumerate(camera_rigs):
         loc = rig.location
