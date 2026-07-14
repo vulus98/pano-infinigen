@@ -15,14 +15,17 @@
 camera.spawn_camera_rigs.n_camera_rigs = 1
 camera.spawn_camera_rigs.camera_rig_config = @camera.multiview_rig_config()
 
-camera.multiview_rig_config.n_views = 8
+camera.multiview_rig_config.n_views = 6
 # Baseline drawn uniformly PER SCENE for baseline diversity. Rooms are small and
 # densely furnished, and EVERY sub-camera of the ring must clear the furniture, so
-# a wide ring finds no valid anchor at all. Keep it small (mean ~0.18 m) -- with
-# full-360 panoramas even this gives usable parallax. Use a plain float to fix it.
-camera.multiview_rig_config.baseline = ("uniform", 0.1, 0.25)  # metres (indoor)
+# too wide a ring finds no valid anchor. This is bigger than the original ~0.18 m
+# mean (that gave too little parallax); a wider ring may reduce valid rigs in tight
+# rooms, so watch placement yield. Use a plain float to fix a single value.
+camera.multiview_rig_config.baseline = ("uniform", 0.25, 0.5)  # metres (indoor)
 camera.multiview_rig_config.pattern = "ring"     # "ring" | "sphere"
 camera.multiview_rig_config.z_amplitude = 0.05   # +/- vertical parallax for the ring
+camera.multiview_rig_config.converge_dist = 3.0  # m: neighbours toe-in (~5-8 deg)
+                                                 # toward a point ~3 m ahead (room scale)
 camera.multiview_rig_config.level_pitch_deg = 90 # must match camera_pose_proposal.pitch
 
 # Level, horizon-facing panoramas.
@@ -45,3 +48,8 @@ compute_base_views.sky_visibility_check = False
 # One valid anchor per scene is enough; don't over-search when validating N
 # sub-cameras per candidate.
 compute_base_views.min_candidates_ratio = 1
+
+# With a wider baseline some rig can't fit all its sub-cameras in a small furnished
+# room. Rather than fail the whole scene, keep the rigs that placed and drop the
+# rest (compute_base_views already resamples up to max_tries before giving up).
+configure_cameras.allow_fewer_rigs = True

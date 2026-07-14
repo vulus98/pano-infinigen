@@ -534,6 +534,7 @@ def render_image(
     dof_aperture_fstop=2.8,
     flat_shading=False,
     override_num_samples=None,
+    apply_flat_shading=True,
 ):
     tic = time.time()
 
@@ -552,7 +553,13 @@ def render_image(
     if override_num_samples is not None:  # usually used for GT
         bpy.context.scene.cycles.samples = override_num_samples
 
-    if flat_shading:
+    if flat_shading and apply_flat_shading:
+        # global_flat_shading() strips every object's materials (a per-object
+        # SelectObjects + material_slot_remove op) and re-clays the whole scene --
+        # O(#objects), minutes on a dense nature scene. It PERMANENTLY mutates scene
+        # state, so a caller rendering many GT cameras can apply it ONCE up front and
+        # pass apply_flat_shading=False here to skip this cost on every subsequent
+        # camera (the compositor is still configured for GT below via flat_shading).
         with Timer("Set object indices"):
             object_data = set_pass_indices()
             json_object = json.dumps(object_data, indent=4)
@@ -569,7 +576,7 @@ def render_image(
 
         with Timer("Flat Shading"):
             global_flat_shading()
-    else:
+    elif not flat_shading:
         segment_materials = "material_index" in (x[0] for x in passes_to_save)
         if segment_materials:
             with Timer("Set material indices"):

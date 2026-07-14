@@ -4,6 +4,7 @@
 # Authors: Alexander Raistrick
 
 import logging
+import os
 import re
 
 import bpy
@@ -282,6 +283,15 @@ def populate_all(
     vis_cull: the max dist outside of the view frustrum to still populate assets
 
     """
+
+    # PANO_FULL_DISK: the decoupled harvest workflow re-places 360 deg panorama
+    # cameras AWAY from this generation camera, so placeholder assets (trees, bushes,
+    # boulders, cacti, ...) that are only REALIZED inside the gen camera's view frustum
+    # (small vis_cull) never appear in the harvested panoramas -> "no trees". Realize a
+    # full DISK instead (every placeholder within dist_cull, in any direction). dist_cull
+    # still bounds the asset count / memory, so keep it modest for harvest.
+    if os.environ.get("PANO_FULL_DISK") and vis_cull is not None:
+        vis_cull = 1e7
 
     results = []
     for col in bpy.data.collections:

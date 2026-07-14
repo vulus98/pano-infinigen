@@ -122,11 +122,12 @@ def get_id(camera: bpy.types.Object):
 
 @gin.configurable
 def multiview_rig_config(
-    n_views=8,
+    n_views=6,
     baseline=0.3,
     pattern="ring",
     z_amplitude=0.0,
     level_pitch_deg=90.0,
+    converge_dist=0.0,
 ):
     """Build a ``camera_rig_config`` describing a small multi-view constellation
     of cameras for panoramic Gaussian-Splatting training data.
@@ -212,14 +213,35 @@ def multiview_rig_config(
     # is world-horizontal. (Yaw about world-Z, applied on top, keeps it level.)
     p = np.deg2rad(level_pitch_deg)
     cp, sp = np.cos(p), np.sin(p)
+    cd = random_general(converge_dist)
+    # Anchor looks along its local -Z; a point converge_dist metres ahead of it is
+    # the convergence target. Neighbours toe IN toward that target (rotate toward
+    # the scene the anchor observes, never away), which also keeps the neighbour
+    # panoramas' framing consistent with the anchor's. converge_dist=0 -> all
+    # cameras share the anchor's orientation (no toe-in).
+    target = Vector((0.0, 0.0, -cd)) if cd and cd > 0 else None
     cfg = []
-    for wx, wy, wz in world_offsets:
+    for idx, (wx, wy, wz) in enumerate(world_offsets):
         loc = (
             float(wx),
             float(cp * wy + sp * wz),
             float(-sp * wy + cp * wz),
         )
-        cfg.append({"loc": loc, "rot_euler": (0.0, 0.0, 0.0)})
+        if idx == 0 or target is None:
+            rot = (0.0, 0.0, 0.0)
+        else:
+            # YAW-ONLY convergence. The rig's level pitch maps the camera's local +Y
+            # to world up, so a rotation about local +Y is a pure YAW about the world
+            # vertical -- the equirect HORIZON STAYS PERFECTLY LEVEL. We rotate the
+            # neighbour's forward (-Z) toward only the HORIZONTAL bearing of the
+            # convergence target and drop its vertical component. Using the full 3D
+            # minimal rotation (rotation_difference) instead mixes in a local X/Z
+            # component, i.e. a roll/pitch that tilts the panorama horizon -- which is
+            # exactly the "weird rotation" we must avoid; a 360 view only needs yaw.
+            direction = (target - Vector(loc)).normalized()
+            yaw = float(np.arctan2(-direction.x, -direction.z))
+            rot = (0.0, yaw, 0.0)
+        cfg.append({"loc": loc, "rot_euler": rot})
 
     return cfg
 
@@ -544,6 +566,7 @@ def compute_base_views(
     panoramic_enclosure_check=False,
     min_pano_near_frac=0.0,
     sky_visibility_check=True,
+    allow_fewer=False,
     **kwargs,
 ):
     import time as _time
@@ -691,9 +714,16 @@ def compute_base_views(
                 break
 
     if len(potential_views) < n_views:
-        if visualize:
-            butil.save_blend("compute_base_views-failed.blend")
-        raise ValueError(f"Could not find {n_views} camera views")
+        if not allow_fewer:
+            if visualize:
+                butil.save_blend("compute_base_views-failed.blend")
+            raise ValueError(f"Could not find {n_views} camera views")
+        # allow_fewer: caller (configure_cameras placing many rigs at once) accepts
+        # however many valid poses we found -- return them instead of failing.
+        logger.warning(
+            f"compute_base_views: found {len(potential_views)}/{n_views} views "
+            f"in {max_tries} tries; returning fewer"
+        )
 
     # Shuffle instead of sorting by openness score — we don't want to bias
     # toward wide-open areas, any outdoor camera that passed the sky check
@@ -1032,6 +1062,7 @@ def configure_cameras(
     nonroom_objs=None,
     mvs_setting=False,
     mvs_radius=("uniform", 12, 18),
+    allow_fewer_rigs=False,
     **kwargs,
 ):
     bpy.context.view_layer.update()
@@ -1081,30 +1112,54 @@ def configure_cameras(
         center_coordinate = None
 
     print("Cam rigs: ", len(cam_rigs))
+    # One compute_base_views search per rig -- the simple, proven approach the
+    # monocular pipeline used to place 300-500 cameras/city. With allow_fewer_rigs a
+    # rig whose search exhausts its retries is skipped (kept rigs still render)
+    # instead of failing the whole scene.
+    placed = []
     for i, cam_rig in enumerate(cam_rigs):
-        views = compute_base_views(
-            cam_rig,
-            n_views=1,
-            location_sample=location_sample,
-            center_coordinate=center_coordinate,
-            radius=mvs_radius,
-            bbox=init_bounding_box,
-            **scene_preprocessed,
-            **kwargs,
-        )
+        try:
+            views = compute_base_views(
+                cam_rig,
+                n_views=1,
+                location_sample=location_sample,
+                center_coordinate=center_coordinate,
+                radius=mvs_radius,
+                bbox=init_bounding_box,
+                **scene_preprocessed,
+                **kwargs,
+            )
+        except ValueError:
+            if not allow_fewer_rigs:
+                raise
+            logger.warning(f"configure_cameras: rig {i} unplaceable; skipping it")
+            continue
 
         score, props, focus_dist = views[0]
         cam_rig.location = props.loc
         cam_rig.rotation_euler = props.rot
-
         for cam in cam_rig.children:
             cam.data.lens = props.focal_length
-
         if focus_dist is not None:
             for cam in cam_rig.children:
-                if not cam.type == "CAMERA":
-                    continue
-                cam.data.dof.focus_distance = focus_dist
+                if cam.type == "CAMERA":
+                    cam.data.dof.focus_distance = focus_dist
+        placed.append(cam_rig)
+
+    if allow_fewer_rigs:
+        unplaced = [r for r in cam_rigs if r not in placed]
+        if unplaced:
+            logger.warning(
+                f"configure_cameras: placed {len(placed)}/{len(cam_rigs)} rigs; "
+                f"removing {len(unplaced)} unplaceable rig(s) so they don't render"
+            )
+            butil.delete([o for r in unplaced for o in (list(r.children) + [r])])
+        if isinstance(cam_rigs, list):
+            cam_rigs[:] = placed  # trim the caller's list to the rigs that rendered
+        if not placed:
+            raise ValueError("configure_cameras: could not place ANY camera rig")
+
+    return placed
 
 
 @gin.configurable

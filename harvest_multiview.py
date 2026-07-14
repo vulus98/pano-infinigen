@@ -211,10 +211,13 @@ def find_and_place_anchor(rig, cams, bvh, bounds, altitude, min_clear, min_sky,
         panorama has close objects that actually produce parallax (rejects empty
         desert/ocean-horizon poses)."""
     x0, x1, y0, y1, zlo, zhi = bounds
+    fails = {"no_ground": 0, "clearance": 0, "low_sky": 0, "low_near": 0}
+    best_sky = best_near = 0.0
     for _ in range(tries):
         x, y = np.random.uniform(x0, x1), np.random.uniform(y0, y1)
         hit, _, _, _ = bvh.ray_cast(Vector((x, y, zhi + 50.0)), Vector((0, 0, -1)))
         if hit is None:
+            fails["no_ground"] += 1
             continue
         z = hit.z + cam_util.random_general(altitude)
         rig.location = Vector((x, y, z))
@@ -228,12 +231,25 @@ def find_and_place_anchor(rig, cams, bvh, bounds, altitude, min_clear, min_sky,
                 clear = False
                 break
         if not clear:
+            fails["clearance"] += 1
             continue
         sky, near = panoramic_stats(cams[0].matrix_world.translation, bvh, near_dist)
-        if sky < min_sky or near < min_near:
+        best_sky, best_near = max(best_sky, sky), max(best_near, near)
+        if sky < min_sky:
+            fails["low_sky"] += 1
+            continue
+        if near < min_near:
+            fails["low_near"] += 1
             continue
         return near  # placed; return the anchor's near_frac (>= 0) so the caller
         #              can account for it against the per-scene sparse budget
+    # Log WHY placement failed so the binding gate is visible (e.g. dense forest ->
+    # 'clearance'/'low_sky' dominate; sparse desert -> 'low_near'). best_* show how
+    # close the best candidate got to the thresholds.
+    logger.info(
+        f"    no anchor in {tries} tries; fail breakdown={fails}, "
+        f"best_sky={best_sky:.2f} (min {min_sky}), best_near={best_near:.2f} (min {min_near})"
+    )
     return None
 
 
@@ -254,10 +270,14 @@ def spawn_rig(rig_id, offsets):
 # --------------------------------------------------------------------------- #
 # Rendering (reuses infinigen's full/flat render_image passes).
 # --------------------------------------------------------------------------- #
-def _render_pass(cam, frames_dir, resolution, samples, passes, flat, ovr, keep):
+def _render_pass(cam, frames_dir, resolution, samples, passes, flat, ovr, keep,
+                 apply_flat=True):
     """Render ONE pass of one camera, then flatten the wanted channels into
     frames_dir/<Channel>/ (no per-camera subfolder -- suffixes are unique, so a
-    whole scene's views for a modality share one folder for easy manipulation)."""
+    whole scene's views for a modality share one folder for easy manipulation).
+
+    apply_flat=False assumes global_flat_shading() was already applied scene-wide,
+    so render_image skips the per-camera O(#objects) material swap (see render.py)."""
     scene = bpy.context.scene
     scene.cycles.samples = samples
     pass_root = frames_dir.parent / "_pass_stage"
@@ -270,6 +290,7 @@ def _render_pass(cam, frames_dir, resolution, samples, passes, flat, ovr, keep):
         flat_shading=flat,
         render_resolution_override=resolution,
         override_num_samples=ovr,
+        apply_flat_shading=apply_flat,
     )  # render_image reorganizes `stage` into `stage.parent/frames/<Channel>/camera_<s>/`
     pass_frames = pass_root / "frames"
     for ch in keep:
@@ -319,11 +340,15 @@ def render_beauty(cam, frames_dir, resolution, samples):
 
 
 def render_gt(cam, frames_dir, resolution, samples):
-    """Ground-truth pass (flat-shaded): metric depth + surface normals."""
+    """Ground-truth pass (flat-shaded): metric depth + surface normals.
+
+    Assumes global_flat_shading() was already applied ONCE for the whole GT phase
+    (harvest_scene does this before the GT loop), so apply_flat=False skips the
+    per-camera material swap -- the slow part of GT rendering on dense scenes."""
     _set_view_transform("Standard")  # data-safe (irrelevant to the raw passes)
     _render_pass(cam, frames_dir, resolution, samples,
                  passes=[("z", "Depth"), ("normal", "Normal")], flat=True, ovr=16,
-                 keep=("Depth", "SurfaceNormal"))
+                 keep=("Depth", "SurfaceNormal"), apply_flat=False)
 
 
 def set_data_color_management():
@@ -375,6 +400,7 @@ def harvest_scene(blend_path, out_root, args):
             baseline=args.baseline,
             pattern=args.pattern,
             z_amplitude=args.z_amplitude,
+            converge_dist=args.converge_dist,
         )
         rig, cams = spawn_rig(k, cfg)
         # First insist on a rich anchor; only if none is found AND we still have
@@ -414,6 +440,13 @@ def harvest_scene(blend_path, out_root, args):
         for cam in cams:
             logger.info(f"  beauty {cam.name}")
             render_beauty(cam, frames, res, args.samples)
+    # Apply the flat-shading clay swap ONCE for the whole GT phase instead of once
+    # per camera inside render_image. It is O(#objects) (a SelectObjects +
+    # material_slot_remove op per object) -- minutes on a dense nature scene -- and
+    # it permanently mutates the scene, so re-running it every GT camera was ~10x the
+    # GT render cost. render_gt now passes apply_flat=False to skip the re-swap.
+    logger.info("  applying global flat shading once for GT phase...")
+    render_mod.global_flat_shading()
     for rig, cams in placed:
         for cam in cams:
             logger.info(f"  gt {cam.name}")
@@ -453,6 +486,9 @@ def main():
                     help="metres; float or 'uniform,lo,hi' (drawn per rig)")
     ap.add_argument("--pattern", default="ring", choices=["ring", "sphere"])
     ap.add_argument("--z-amplitude", type=float, default=0.2)
+    ap.add_argument("--converge-dist", type=float, default=15.0,
+                    help="neighbours toe-in toward a point this many m ahead of the "
+                    "anchor (converge on the scene); 0 to disable (currently disabled)")
     ap.add_argument("--altitude", type=_spec, default=("uniform", 0.75, 1.75),
                     help="metres above ground; float or 'uniform,lo,hi'")
     ap.add_argument("--resolution", type=lambda s: [int(x) for x in s.split(",")], default=[4096, 2048])
@@ -467,6 +503,11 @@ def main():
     ap.add_argument("--min-near", type=float, default=0.2,
                     help="a rig is 'rich' when this fraction of the horizontal band "
                     "has content within --near-dist; rich anchors are always kept")
+    ap.add_argument("--render-min-near", type=float, default=0.15,
+                    help="POST-RENDER gate: after rendering, drop any rig whose "
+                    "measured (rendered-depth) anchor near_frac is below this. The "
+                    "placement raycast over-reads near content on high vistas; this "
+                    "ground-truth gate removes the empty/washed-out panoramas. 0 = off")
     ap.add_argument("--sparse-frac", type=float, default=0.2,
                     help="max fraction of a scene's rigs allowed to be low-parallax "
                     "(near_frac < --min-near). Keeps SOME sparse/open views in the "
@@ -489,13 +530,22 @@ def main():
         except Exception as e:
             logger.error(f"scene {blend} failed: {e}")
 
-    # Build manifests (+ prune) across everything we produced.
+    # Build manifests (+ prune), then collapse to the unified layout.
     if total:
         logger.info("Building per-set manifests...")
-        from build_multiview_manifest import build_scene_manifests, prune_scene
+        from build_multiview_manifest import (
+            build_scene_manifests, prune_scene, prune_low_parallax, finalize_scene,
+        )
         for scene_dir in sorted(p for p in args.output.iterdir() if (p / "frames").is_dir()):
             build_scene_manifests(scene_dir)
             prune_scene(scene_dir)
+            # Ground-truth density gate: drop rigs that RENDERED empty/washed-out
+            # (rendered near_frac < threshold), which the placement raycast misses.
+            prune_low_parallax(scene_dir, args.render_min_near)
+        # args.output is <base>/multiview; finalize the <base> so the result is
+        # <base>/rig_<k>/... (removes the multiview/<hash>/frames nesting AND the
+        # multi-GB source scene), matching indoor/urban exactly.
+        finalize_scene(args.output.parent)
     logger.info(f"Done: {total} multi-view rig(s) across {len(blends)} scene(s).")
 
 

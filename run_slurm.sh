@@ -34,7 +34,14 @@ module load eth_proxy
 num_scenes=1
 num_concurrent=32
 folder_name="${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
-base_output="outputs/${SCENE_TYPE}/${folder_name}"
+# Top output folder is the ENVIRONMENT (indoor/outdoor/urban), not the generator
+# mode -- so all three datasets live under a consistent outputs/<env>/ tree.
+case "$SCENE_TYPE" in
+    harvest)   ENV=outdoor ;;
+    multiview) ENV="${MV_DOMAIN:-outdoor}" ;;
+    *)         ENV="$SCENE_TYPE" ;;   # indoor / outdoor / urban already correct
+esac
+base_output="outputs/${ENV}/${folder_name}"
 
 
 if [ "$SCENE_TYPE" == "outdoor" ]; then
@@ -65,19 +72,63 @@ elif [ "$SCENE_TYPE" == "multiview" ]; then
     # sub-cameras). >1 amortizes scene-gen over several rigs -- the practical way to
     # get multiple rigs from an INDOOR scene (the decoupled harvest workflow is
     # outdoor-only, as it needs open sky to place anchors).
-    N_VIEWS=${N_VIEWS:-8}
-    N_RIGS=${N_RIGS:-1}
+    N_VIEWS=${N_VIEWS:-6}
     MV_DOMAIN=${MV_DOMAIN:-outdoor}
+    # Terrain-mesh (OcMesher) resolution for native outdoor generation. Match the
+    # render resolution so the camera-optimized mesh is ~1 facet/pixel and the ground
+    # doesn't show low-poly triangles up close.
+    GEN_RES_MV=${GEN_RES_MV:-2048,1024}
+    # N_RIGS default is domain-aware: INDOOR amortizes the (expensive) room scene-gen
+    # over several rigs -- 5 per room, matching urban's 5 rigs/city -- while OUTDOOR
+    # multiview defaults to 1 (the decoupled harvest workflow is the outdoor multi-rig
+    # path). Override with N_RIGS=<n>.
+    if [ "$MV_DOMAIN" == "indoor" ]; then
+        N_RIGS=${N_RIGS:-5}
+    else
+        # NATIVE outdoor: infinigen places the panorama rig(s) DURING generation and
+        # builds terrain + vegetation FOR them (360 deg populated automatically), so a
+        # few rigs per scene amortize the gen -- no re-placement (that was the harvest
+        # workflow, which left the panoramas barren/blocky). A test placed 2 rigs; 3 is
+        # a reasonable default.
+        N_RIGS=${N_RIGS:-3}
+    fi
     if [ "$MV_DOMAIN" == "indoor" ]; then
         SCENE_CONFIGS="singleroom.gin fast_solve.gin multiview.gin"
         PIPE_CONFIGS="local_256GB.gin multiview.gin blender_gt.gin indoor_background_configs.gin"
         DOMAIN_PIPE_OVR="get_cmd.driver_script='infinigen_examples.generate_indoors'"
         DOMAIN_OVR="compose_indoors.restrict_single_supported_roomtype=True compose_indoors.lights_off_chance=0.0"
     else
-        SCENE_CONFIGS="simple.gin multiview.gin"
+        # Native outdoor (nature): pick a biome per scene -- ~30% SPARSE open
+        # landscapes, ~70% DENSE (trees/water/rock) -- instead of infinigen's random
+        # roll. Same mix the harvest path used; here the scene is built for the rig.
+        DENSE_BIOMES=(canyon forest river cliff coast mountain)
+        SPARSE_BIOMES=(desert plain arctic snowy_mountain)
+        SPARSE_EVERY=${SPARSE_EVERY:-3}   # ~30% sparse
+        _idx=${SLURM_ARRAY_TASK_ID:-1}
+        if [ "$BIOME" = "random" ]; then _BIOME_CFG=""
+        elif [ -n "$BIOME" ]; then _BIOME_CFG="${BIOME}.gin"
+        elif [ $(( _idx % SPARSE_EVERY )) -eq 0 ]; then
+            _BIOME_CFG="${SPARSE_BIOMES[$(( (_idx / SPARSE_EVERY) % ${#SPARSE_BIOMES[@]} ))]}.gin"
+        else
+            _BIOME_CFG="${DENSE_BIOMES[$(( _idx % ${#DENSE_BIOMES[@]} ))]}.gin"
+        fi
+        echo "Native outdoor biome: ${_BIOME_CFG:-<infinigen random>}"
+        SCENE_CONFIGS="simple.gin ${_BIOME_CFG} multiview.gin"
         PIPE_CONFIGS="local_256GB.gin multiview.gin blender_gt.gin"
         DOMAIN_PIPE_OVR=""
-        DOMAIN_OVR=""
+        # Cap render-phase concurrency for native outdoor. A 2k, multi-rig scene has a
+        # huge per-render-process host-RAM footprint; manage_jobs' default of 32
+        # concurrent render/GT subprocesses => peak = 32 x footprint => >150 GB OOM.
+        # The node's single GPU serializes actual rendering anyway, so high host-side
+        # concurrency only multiplies RAM. A small cap keeps GT/CPU work overlapped
+        # while bounding peak. Override with MV_NUM_CONCURRENT=<n>.
+        num_concurrent=${MV_NUM_CONCURRENT:-6}
+        # Terrain-mesh resolution for the native, camera-optimized OcMesher, plus a
+        # bigger outdoor baseline range (config default 0.3-0.7 m is small for open
+        # scenes) as a gin tuple -- unless the user forced a fixed BASELINE. Cameras
+        # are already placed >= min_terrain_distance (=2 m) from terrain.
+        DOMAIN_OVR="execute_tasks.generate_resolution=($GEN_RES_MV)"
+        [ -z "$BASELINE" ] && DOMAIN_OVR="$DOMAIN_OVR camera.multiview_rig_config.baseline=(\"uniform\", 0.7, 1.4)"
     fi
     # By default the baseline is drawn per-scene from the config's uniform range
     # (baseline diversity). Set BASELINE=<metres> to force a single fixed value.
@@ -87,7 +138,10 @@ elif [ "$SCENE_TYPE" == "multiview" ]; then
         BASELINE_OVR=""; BL_LABEL="config range (variable)"
     fi
     # Optional render resolution override, e.g. RES=1024,512 (default: config res).
-    if [ -n "$RES" ]; then RES_OVR="render_image.render_resolution_override=($RES)"; else RES_OVR=""; fi
+    # Render at 2k by default (was 4096x2048 from the scene config) for a manageable
+    # dataset, consistent with outdoor/urban. Override with RES=W,H.
+    RES=${RES:-2048,1024}
+    RES_OVR="render_image.render_resolution_override=($RES)"
     echo "Running Multi-view Panorama Generation (${MV_DOMAIN}, N_RIGS=${N_RIGS}, N_VIEWS=${N_VIEWS}, BASELINE=${BL_LABEL})..."
     python -m infinigen.datagen.manage_jobs --output_folder "$base_output" --num_scenes $num_scenes \
         --configs $SCENE_CONFIGS \
@@ -107,10 +161,20 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
     # scene; each rig gets its own (optionally random) baseline.
     #   Time scales with RIGS_PER_SCENE * N_VIEWS * resolution -- tune to fit the
     #   SBATCH --time budget (full-res renders are minutes each).
-    N_VIEWS=${N_VIEWS:-8}
+    N_VIEWS=${N_VIEWS:-6}
     RIGS_PER_SCENE=${RIGS_PER_SCENE:-4}
-    BASELINE=${BASELINE:-uniform,0.3,0.7}
-    RES=${RES:-4096,2048}
+    # Bigger baseline for stronger parallax (outdoor scenes are open / deep). Each
+    # sub-camera still must clear geometry (min_clearance), so very dense scenes may
+    # place fewer rigs. Override with BASELINE=<m> or 'uniform,lo,hi'.
+    BASELINE=${BASELINE:-uniform,1.0,2.0}
+    RES=${RES:-2048,1024}
+    # Terrain-mesh resolution for scene GENERATION (independent of the throwaway
+    # render size below). infinigen's SphericalMesher meshes terrain + atmosphere
+    # 360 deg around the gen camera, sizing facets by this camera resolution. It
+    # MUST be near the final render resolution -- (64,32) meshes huge coarse facets
+    # (low-poly terrain + blocky atmosphere = the fog/dome sky artifacts). Default
+    # to the final RES; override with GEN_RES for speed.
+    GEN_RES=${GEN_RES:-$RES}
     SAMPLE_RADIUS=${SAMPLE_RADIUS:-30}
 
     # Biome-controlled density. infinigen's scene_types is mandatory-exclusive, so
@@ -122,23 +186,54 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
     # gate, so MIN_NEAR defaults to 0 -> every scene reliably yields RIGS_PER_SCENE
     # rigs, and ~20% of the dataset is (deliberately) sparse.
     #   Override: BIOME=<name> forces one biome; BIOME=random restores infinigen's
-    #   random roll; SPARSE_EVERY=<n> makes 1-in-n scenes sparse (default 5 = 20%).
-    DENSE_BIOMES=(forest canyon cliff mountain river coast)
+    #   random roll; SPARSE_EVERY=<n> makes 1-in-n scenes sparse (default 3 ~= 30%).
+    # Ordered so the lushest biomes land on the low array indices (idx%6 = 1,2,4,5 =>
+    # forest,river,coast,mountain) -- the rockier canyon/cliff sit at 0,3 -- so small
+    # sample runs show nice near-content dense scenes; full production still cycles all.
+    DENSE_BIOMES=(canyon forest river cliff coast mountain)
     SPARSE_BIOMES=(desert plain arctic snowy_mountain)
-    SPARSE_EVERY=${SPARSE_EVERY:-5}
+    SPARSE_EVERY=${SPARSE_EVERY:-3}   # ~30% sparse, ~70% dense
     _idx=${SLURM_ARRAY_TASK_ID:-1}
+    _is_sparse=0
     if [ "$BIOME" = "random" ]; then BIOME_CFG=""
     elif [ -n "$BIOME" ]; then BIOME_CFG="${BIOME}.gin"
     elif [ $(( _idx % SPARSE_EVERY )) -eq 0 ]; then
-        BIOME_CFG="${SPARSE_BIOMES[$(( (_idx / SPARSE_EVERY) % ${#SPARSE_BIOMES[@]} ))]}.gin"
+        BIOME_CFG="${SPARSE_BIOMES[$(( (_idx / SPARSE_EVERY) % ${#SPARSE_BIOMES[@]} ))]}.gin"; _is_sparse=1
     else
         BIOME_CFG="${DENSE_BIOMES[$(( _idx % ${#DENSE_BIOMES[@]} ))]}.gin"
     fi
-    echo "Biome for this scene: ${BIOME_CFG:-<infinigen random>}"
-    # MIN_NEAR>0 re-enables the per-rig parallax gate (+ SPARSE_FRAC budget); with
-    # biome-controlled density we keep it off so all rigs place.
-    MIN_NEAR=${MIN_NEAR:-0}
-    SPARSE_FRAC=${SPARSE_FRAC:-0.2}
+    echo "Biome for this scene: ${BIOME_CFG:-<infinigen random>} (sparse=${_is_sparse})"
+    # Near-content gate. Even DENSE biomes have clearings, and with the gate off a
+    # camera can land in one and shoot an empty, washed-out panorama (no near
+    # geometry). So require a small fraction of near content at each anchor for
+    # DENSE scenes; keep it OFF for the ~20% SPARSE scenes (deliberately open).
+    # find_and_place_anchor resamples up to its try budget, then harvest keeps
+    # however many rigs passed (fewer, not a failed scene).
+    # Near-content gates are DOMAIN-AWARE:
+    #   SPARSE biomes (desert/plain/...) are INTENTIONALLY open -> place any anchor
+    #     (MIN_NEAR=0) and NEVER post-render-prune them (RENDER_MIN_NEAR=0); they are
+    #     the deliberate ~30% open-landscape share of the dataset.
+    #   DENSE biomes should have near content, but the placement raycast over-reads
+    #     it, so keep the placement gate modest (0.12; instrumentation showed a real
+    #     forest's best anchor is ~0.19) and let the RENDERED-depth prune (0.10) be the
+    #     reliable backstop that drops only genuinely empty / washed-out dense rigs.
+    if [ "$_is_sparse" = "1" ]; then
+        MIN_NEAR=${MIN_NEAR:-0}
+        RENDER_MIN_NEAR=${RENDER_MIN_NEAR:-0}
+    else
+        MIN_NEAR=${MIN_NEAR:-0.12}
+        RENDER_MIN_NEAR=${RENDER_MIN_NEAR:-0.10}
+    fi
+    SPARSE_FRAC=${SPARSE_FRAC:-0}
+    # Placement robustness. Nature scenes vary a lot: a DENSE forest has a canopy
+    # overhead (little open sky) and trees close on every side, so the default gates
+    # (>=10% sky AND all 6 ring-cameras >=0.3 m clear) reject every anchor and the
+    # scene yields 0 rigs even though it's rich. Relax the sky floor (a forest floor
+    # legitimately sees only a few % sky through the canopy) and give more tries so
+    # dense scenes reliably place. The post-render near_frac gate still guards quality.
+    MIN_SKY=${MIN_SKY:-0.04}
+    MIN_CLEAR=${MIN_CLEAR:-0.3}
+    PLACE_TRIES=${PLACE_TRIES:-8000}
     scene_dir="${base_output}/scene"
     mv_dir="${base_output}/multiview"
 
@@ -160,16 +255,29 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
     # seed => a different scene, so a retry dodges a scene-specific hang/crash.
     GEN_TRIES=${GEN_TRIES:-3}
     GEN_TIMEOUT=${GEN_TIMEOUT:-50m}
+    # Terrain mesher. infinigen's default (OcMesher, from base.gin) meshes the terrain
+    # VIEW-DEPENDENTLY for the throwaway generation camera -- fine in its cone, coarse
+    # elsewhere. harvest_multiview then re-places 360 deg cameras at DIFFERENT spots,
+    # so they see the coarsely-meshed side => big blocky facets. UniformMesher meshes
+    # the whole terrain uniformly (view-independent), so it looks good from any
+    # harvested camera. Costs more gen time/memory; MESHER_SUBDIV controls density.
+    MESHER=${MESHER:-UniformMesher}
+    MESHER_SUBDIV=${MESHER_SUBDIV:-448}   # finer terrain (kills near-camera facets); ~5min mesh
+    if [ "$MESHER" != "OcMesher" ] && [ "$MESHER" != "SphericalMesher" ]; then
+        MESHER_OVR=("fine_terrain.mesher_backend=\"$MESHER\"" "UniformMesher.subdivisions=($MESHER_SUBDIV, -1, -1)")
+    else
+        MESHER_OVR=("fine_terrain.mesher_backend=\"$MESHER\"")
+    fi
     blend=""
     for attempt in $(seq 1 "$GEN_TRIES"); do
-        echo "Generating one scene (tiny throwaway render), attempt ${attempt}/${GEN_TRIES}..."
+        echo "Generating one scene (tiny throwaway render), attempt ${attempt}/${GEN_TRIES}, mesher=${MESHER}..."
         rm -rf "$scene_dir"
         timeout "$GEN_TIMEOUT" python -m infinigen.datagen.manage_jobs --output_folder "$scene_dir" --num_scenes 1 \
             --configs simple.gin $BIOME_CFG \
             --pipeline_configs local_256GB.gin monocular.gin blender_gt.gin \
             --pipeline_overrides LocalScheduleHandler.use_gpu=True manage_datagen_jobs.num_concurrent=1 \
-            --overrides "render_image.render_resolution_override=(64, 32)" "execute_tasks.generate_resolution=(64, 32)" \
-                "configure_render_cycles.num_samples=1" \
+            --overrides "render_image.render_resolution_override=(64, 32)" "execute_tasks.generate_resolution=($GEN_RES)" \
+                "configure_render_cycles.num_samples=1" "${MESHER_OVR[@]}" \
             --wandb_mode disabled
         blend=$(find "$scene_dir" -path '*fine/scene.blend' 2>/dev/null | head -1)
         [ -n "$blend" ] && break
@@ -183,6 +291,8 @@ elif [ "$SCENE_TYPE" == "harvest" ]; then
         --rigs-per-scene "$RIGS_PER_SCENE" --n-views "$N_VIEWS" --baseline "$BASELINE" \
         --resolution "$RES" --sample-radius "$SAMPLE_RADIUS" \
         --min-near "$MIN_NEAR" --sparse-frac "$SPARSE_FRAC" \
+        --render-min-near "$RENDER_MIN_NEAR" \
+        --min-sky "$MIN_SKY" --min-clearance "$MIN_CLEAR" --place-tries "$PLACE_TRIES" \
         --seed "${SLURM_ARRAY_TASK_ID:-0}"
 
     # The multi-view sets are in $mv_dir; the source scene (incl. the ~1-2 GB
@@ -197,12 +307,20 @@ elif [ "$SCENE_TYPE" == "urban" ]; then
     # as 360 panoramas -- and writes one pose-registered transforms.json per rig.
     # Set N_VIEWS=1 to fall back to single independent panoramas (no manifest).
     #   Time scales with N_RIGS * N_VIEWS * resolution (full-res ~3.4 min/camera).
-    N_VIEWS=${N_VIEWS:-8}
+    N_VIEWS=${N_VIEWS:-6}
     N_RIGS=${N_RIGS:-40}
-    BASELINE=${BASELINE:-uniform,0.3,0.6}
-    RES=${RES:-4096,2048}
+    # Bigger baseline: cities are large/open with deep sightlines, so a ~0.4 m ring
+    # gave weak parallax. 1-2 m gives strong parallax while sub-cameras stay on the
+    # street. Override with BASELINE=<m> or 'uniform,lo,hi'.
+    BASELINE=${BASELINE:-uniform,1.0,2.0}
+    RES=${RES:-2048,1024}
+    # Resampling: dense downtowns put ~2/3 of ring sub-cameras inside a building, so
+    # placing exactly N_RIGS yields only ~1/3 complete rigs. Over-place OVERSAMPLE x
+    # N_RIGS candidates, cheaply depth-probe each, and keep the first N_RIGS whose
+    # cameras all clear geometry -- only those get the full 2k render.
+    OVERSAMPLE=${OVERSAMPLE:-3.0}
     city_dir="models/city${SLURM_ARRAY_TASK_ID}"
-    echo "Running Urban (iCity) multi-view Generation for ${city_dir} (N_VIEWS=${N_VIEWS}, N_RIGS=${N_RIGS})..."
+    echo "Running Urban (iCity) multi-view Generation for ${city_dir} (N_VIEWS=${N_VIEWS}, N_RIGS=${N_RIGS}, OVERSAMPLE=${OVERSAMPLE})..."
     if [ ! -d "$city_dir" ]; then
         echo "Error: ${city_dir} does not exist, skipping."
         exit 1
@@ -214,9 +332,10 @@ elif [ "$SCENE_TYPE" == "urban" ]; then
     python process_custom_blend.py --city_dir "$city_dir" \
         -g local_256GB.gin monocular.gin blender_gt.gin \
         -p "camera.spawn_camera_rigs.n_camera_rigs=$N_RIGS" \
-           "camera.compute_base_views.max_tries=100000" \
+           "camera.compute_base_views.max_tries=30000" \
            $RIG_OVR \
         --n-views "$N_VIEWS" --baseline "$BASELINE" --resolution "$RES" \
+        --oversample "$OVERSAMPLE" \
         --seed 0
 
 else

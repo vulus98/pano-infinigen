@@ -4,6 +4,7 @@
 import argparse
 import itertools
 import logging
+import os
 from pathlib import Path
 
 import bpy
@@ -370,12 +371,20 @@ def compose_nature(output_folder, scene_seed, **params):
     )
 
     with logging_util.Timer("Compute coarse terrain frustrums"):
+        # PANO_FULL_DISK: the decoupled harvest workflow re-places 360 deg panorama
+        # cameras AWAY from this generation camera, so ground-cover scatters (grass,
+        # ferns, flowers, rocks, monocots) that are culled to the gen camera's view
+        # frustum (vis_margin=2) leave the harvested panoramas as bare dirt. A huge
+        # vis_margin makes the frustum test always pass, so those scatters populate a
+        # full DISK (out to inview_distance) around the camera and are visible from
+        # any re-placed harvest camera.
+        _inview_margin = 1e7 if os.environ.get("PANO_FULL_DISK") else 2
         terrain_inview, *_ = split_in_view.split_inview(
             terrain_mesh,
             primary_cams,
             verbose=True,
             outofview=False,
-            vis_margin=2,
+            vis_margin=_inview_margin,
             dist_max=params["inview_distance"],
             hide_render=True,
             suffix="inview",
