@@ -24,6 +24,20 @@ NOTE: each frame in transforms.json carries depth_path/normal_path pointing at t
 ORIGINAL render layout (.npy). The packed tars store depth as .npz and normals as
 .png (the raw float normal .npy is dropped). Always resolve members via the patterns
 in dataset_info.json["schema"], as this loader does -- not via those fields.
+
+GEOMETRY CONVENTION (verified end-to-end by pose_check.py -- sub-pixel cycle
+consistency and 3-5x photometric gain over a no-motion baseline, on all 3 domains):
+
+  pose  : transforms.json "convention" = blender_cam_to_world, i.e. transform_matrix
+          is CAMERA->WORLD. Camera space is -Z forward, +Y up, +X right.
+  pixels: equirect mapping, image centre = camera forward
+            theta = ((u + 0.5)/W - 0.5) * 2*pi
+            phi   = (0.5 - (v + 0.5)/H) * pi
+            dir   = (cos(phi)*sin(theta), sin(phi), -cos(phi)*cos(theta))
+  depth : RADIAL distance along that ray (NOT planar z). 3D point = dir * depth.
+
+  The per-frame "intrinsics" matrix is a placeholder for the equirect model (focal
+  ~ -2.2e-05) -- do NOT project with it; use the mapping above.
 """
 
 import io
