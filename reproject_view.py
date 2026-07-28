@@ -95,6 +95,47 @@ def reproject(src_rgb, dst_depth, dst_pose, src_pose, bilinear=False):
     return out, valid
 
 
+def forward_render(src_rgb, src_depth, src_pose, dst_pose):
+    """
+    Forward warp: unproject the SOURCE view into a 3D point cloud (using the SOURCE
+    depth), then RENDER that cloud at the DST pose. This is the "base RGB+depth ->
+    point cloud -> novel view" test; unlike reproject() it uses the SOURCE depth and
+    produces holes at disocclusions.
+
+        src_rgb   : (H, W, 3)  base-view image (each pixel becomes a coloured 3D point)
+        src_depth : (H, W)     radial depth of the base view
+        src_pose  : (4, 4)     base camera-to-world
+        dst_pose  : (4, 4)     novel camera-to-world (where we render the cloud)
+    returns:
+        out    : (H, W, 3)     rendered novel view (0 where nothing splats)
+        filled : (H, W) bool   which novel pixels a point actually covered
+
+    Occlusion is resolved with a z-buffer (nearest point to the DST camera wins).
+    """
+    H, W = src_depth.shape
+    # 1) SOURCE pixels -> 3D points in world
+    pts_cam = equirect_rays(H, W) * np.nan_to_num(src_depth)[..., None]
+    pts_world = pts_cam @ src_pose[:3, :3].T + src_pose[:3, 3]
+    # 2) project the cloud into the DST camera; range = distance to DST cam (z-buffer key)
+    pts_dst = (pts_world - dst_pose[:3, 3]) @ dst_pose[:3, :3]
+    rng = np.linalg.norm(pts_dst, axis=-1)
+    u, v = rays_to_pixels(pts_dst, H, W)
+
+    m = np.isfinite(src_depth) & (src_depth > 0) & np.isfinite(rng) & (rng > 0)
+    lin = (np.clip(np.rint(v).astype(np.int64), 0, H - 1) * W
+           + (np.rint(u).astype(np.int64) % W))[m]
+    col = src_rgb[m].astype(np.float32)
+    rr = rng[m]
+
+    # 3) z-buffer splat: sort far->near so the nearest point is written last (wins)
+    order = np.argsort(-rr)
+    out = np.zeros((H * W, 3), np.float32)
+    filled = np.zeros(H * W, bool)
+    out[lin[order]] = col[order]
+    filled[lin[order]] = True
+    return out.reshape(H, W, 3), filled.reshape(H, W)
+
+
 def relative_pose(dst_pose, src_pose):
     """4x4 transform taking SRC-camera coords into DST-camera coords (dst^-1 @ src)."""
     inv = np.eye(4)
